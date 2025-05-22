@@ -1,1 +1,27 @@
-print('안녕, 김재현!')
+def declareWar():
+
+
+
+
+
+def makePeaceDeal():
+
+
+
+
+
+
+def makeAlly():
+
+
+
+
+
+def breakAlly():
+
+
+
+
+
+
+def expandRole():
