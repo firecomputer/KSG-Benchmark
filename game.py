@@ -16,7 +16,7 @@ screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
 # Load black dot coordinates from the JSON file
 try:
-    with open('../KSG Benchmark/black_dot_coordinates.json', 'r') as f:
+    with open('black_dot_coordinates.json', 'r') as f:
         black_dots_data = json.load(f)
 except FileNotFoundError:
     print("Error: black_dot_coordinates.json not found.")
