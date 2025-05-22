@@ -1,5 +1,10 @@
+def budget():
+
+
+
+
 def declareWar():
-    f
+
 
 
 
