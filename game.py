@@ -3,7 +3,7 @@ import sys
 import json
 import random
 
-# 0.5x of Total Image width and height
+# 0.33x of Total Image width and height
 SCREEN_WIDTH = 551
 SCREEN_HEIGHT = 964
 
@@ -25,7 +25,7 @@ except json.JSONDecodeError:
     print("Error: Could not decode JSON from black_dot_coordinates.json.")
     black_dots_data = []
 
-# --- New Code ---
+# Classes (Will be moved to another file)
 
 class Tile:
     def __init__(self, x, y, is_black_dot=False):
@@ -34,11 +34,11 @@ class Tile:
         self.is_black_dot = is_black_dot
         # Add other tile properties here later, e.g., unit, terrain type, etc.
 
-'''
+
 class Country:
     def __init__(self, tile_grid):
         self.startPos = random.randint(0, len(tile_grid))
-'''
+        
         
 
 # Create a 2D grid of Tile instances

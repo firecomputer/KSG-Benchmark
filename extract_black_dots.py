@@ -4,7 +4,7 @@ import os
 
 def extract_black_dots(image_path, output_json_path):
     """
-    Extracts the top-left coordinates of all 2x2 black pixel clusters
+    Extracts the top-left coordinates of all 3x3 black pixel clusters
     from an image and saves them to a JSON file.
 
     Args:
