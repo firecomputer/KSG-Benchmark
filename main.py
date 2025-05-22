@@ -1,11 +1,10 @@
 def declareWar():
-
+    f
 
 
 
 
 def makePeaceDeal():
-
 
 
 
