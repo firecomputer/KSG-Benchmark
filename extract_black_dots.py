@@ -20,8 +20,8 @@ def extract_black_dots(image_path, output_json_path):
 
         # Iterate through the image, stopping 1 pixel before the edge
         # to allow checking for a 3x3 block.
-        for y in range(0, height, 11):
-            for x in range(0, width, 11):
+        for y in range(0, height, 2):
+            for x in range(0, width, 2):
                 # Check if the current pixel and its neighbors form a 2x2 black square
                 # A pixel is considered black if its RGB values are all 0.
                 is_black = is_nearly_black(pixels, x, y)
@@ -59,14 +59,14 @@ def is_nearly_black(image_array, start_x, start_y, threshold=5):
         bool: 평균값이 (0,0,0)에 근접하면 True, 그렇지 않으면 False.
     """
 
-    end_x = start_x + 11
-    end_y = start_y + 11
+    end_x = start_x + 2
+    end_y = start_y + 2
 
     # 이미지 배열의 크기 확인
     height, width = image_array.shape[:2]
 
     # 유효한 영역인지 확인
-    if not (0 <= start_x <= width - 12 and 0 <= start_y <= height - 12):
+    if not (0 <= start_x <= width - 3 and 0 <= start_y <= height - 3):
         print(f"오류: 지정된 시작 좌표 [{start_x}, {start_y}]는 유효한 10x10 영역을 포함하지 않습니다.")
         return False
 
