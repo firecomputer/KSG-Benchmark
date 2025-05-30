@@ -31,6 +31,7 @@ ARMY_BASE_STRENGTH = 2000 # 기본 군대 병력
 GAME_TICKS_PER_LOGICAL_SECOND = 30 # 1초에 해당하는 게임 틱 수 (기존 60에서 변경)
 ARMY_MAX_STRENGTH = 1000000 # 최대 군대 병력
 GDP_STRENGTH_MULTIPLIER = 0.001 # GDP 1당 추가 병력 (GDP 100만 = +1000 병력)
+GDP_BATTLE_STRENGTH_FACTOR = 0.000005 # GDP가 전투력에 미치는 영향 계수 (예: GDP 100만당 전투력 5배)
 ARMY_MAINTENANCE_PER_STRENGTH_PER_TICK = 1 / (60 / GAME_TICKS_PER_LOGICAL_SECOND)
 GDP_LOW_THRESHOLD = 100000
 FIXED_GDP_BOOST_PER_TICK = 500 / (60 / GAME_TICKS_PER_LOGICAL_SECOND)
@@ -612,14 +613,33 @@ class Battle:
         return 1.0
     
     def get_current_attack_strength(self):
-        """현재 공격군의 총 병력을 반환합니다."""
-        base_strength = sum(army.strength for army in self.attacking_armies if army.strength > 0) * self.attack_penalty
+        """현재 공격군의 총 병력을 반환합니다. GDP 보너스 포함."""
+        total_attack_strength = 0
+        for army in self.attacking_armies:
+            if army.strength > 0 and army.owner:
+                gdp_bonus = 1 + (army.owner.get_total_gdp() * GDP_BATTLE_STRENGTH_FACTOR)
+                total_attack_strength += army.strength * gdp_bonus
+        
+        base_strength = total_attack_strength * self.attack_penalty
         return base_strength * self.random_factor
     
     def get_current_defense_strength(self):
-        """현재 방어군의 총 병력을 반환합니다."""
-        army_strength = sum(army.strength for army in self.defending_armies if army.strength > 0)
-        base_strength = (army_strength + self.province_defense_strength) * self.defense_penalty
+        """현재 방어군의 총 병력을 반환합니다. GDP 보너스 포함."""
+        total_defense_strength = 0
+        # 방어 군대 병력에 GDP 보너스 적용
+        for army in self.defending_armies:
+            if army.strength > 0 and army.owner:
+                gdp_bonus = 1 + (army.owner.get_total_gdp() * GDP_BATTLE_STRENGTH_FACTOR)
+                total_defense_strength += army.strength * gdp_bonus
+        
+        # 프로빈스 자체 방어력에도 GDP 보너스 적용 (프로빈스 소유 국가 기준)
+        if self.province.owner:
+            province_gdp_bonus = 1 + (self.province.owner.get_total_gdp() * GDP_BATTLE_STRENGTH_FACTOR)
+            total_defense_strength += self.province_defense_strength * province_gdp_bonus
+        else: # 프로빈스 소유자가 없는 경우 (예: 중립 지역)
+            total_defense_strength += self.province_defense_strength
+
+        base_strength = total_defense_strength * self.defense_penalty
         return base_strength * self.random_factor
     
     def update(self):
@@ -1256,13 +1276,13 @@ countries = [] # 국가 객체들을 저장할 리스트
 # 각 국가는 무작위 육지 프로빈스를 시작 프로빈스로 가짐
 if provinces:
     # 육지 프로빈스만 필터링 (land_coords에 속한 타일로만 구성된 프로빈스)
-    # 모든 타일이 land_coords에 있어야 육지 프로빈스로 간주
-    valid_start_provinces = [p for p in provinces if all((t.x, t.y) in land_coords for t in p.tiles)]
+    # 모든 타일이 land_coords에 있어야 육지 프로빈스로 간주하고, 섬이 아니어야 함
+    valid_start_provinces = [p for p in provinces if all((t.x, t.y) in land_coords for t in p.tiles) and not p.is_island]
     
     if valid_start_provinces:
         for i in range(COUNTRY_COUNT):
-            # 아직 소유되지 않은 육지 프로빈스 중에서 선택
-            available_provinces = [p for p in valid_start_provinces if p.owner is None]
+            # 아직 소유되지 않은, 섬이 아닌 육지 프로빈스 중에서 선택
+            available_provinces = [p for p in valid_start_provinces if p.owner is None] # valid_start_provinces에서 이미 섬이 걸러짐
             if available_provinces:
                 start_province = random.choice(available_provinces)
                 
@@ -1551,15 +1571,42 @@ while running:
                 # 여기서는 일단 NameError만 해결하는 방향으로 최소 수정.
                 # if idle_armies: # 이 조건은 이미 위에 있음.
                 for p in provinces: # 이 for문은 공격 목표를 찾는 로직
-                    if p.owner and p.owner != country:
-                        can_attack = False
+                    if p.owner and p.owner != country: # 적 프로빈스인 경우
+                        can_attack_directly = False # 직접 국경을 맞대고 공격 가능한지
+                        can_attack_island = False   # 해안에서 섬을 공격 가능한지
+
                         for owned_p in country.owned_provinces:
+                            # 1. 직접 국경을 맞댄 경우 (기존 로직)
                             if p in owned_p.border_provinces and \
                                (not owned_p.is_island and country.is_province_connected_to_capital(owned_p) or owned_p.is_island):
-                                can_attack = True
-                                break
-                        if can_attack:
-                            potential_enemy_targets.append(p)
+                                can_attack_directly = True
+                                break # 직접 공격 가능하면 더 볼 필요 없음
+                            
+                            # 2. 섬 공격 가능성 확인 (새로 추가된 로직)
+                            # 조건: 아군 프로빈스가 해안이고, 수도와 연결되어 있으며 (또는 자신이 섬이거나)
+                            #       적 프로빈스는 섬이어야 함.
+                            if owned_p.is_coastal and \
+                               (owned_p.is_island or country.is_province_connected_to_capital(owned_p)) and \
+                               p.is_island:
+                                # 해안 프로빈스와 섬 사이의 거리 계산 (간단히 중심점 간 거리)
+                                owned_p_center_x, owned_p_center_y = owned_p.get_center_coordinates()
+                                island_p_center_x, island_p_center_y = p.get_center_coordinates()
+                                
+                                distance_to_island = math.sqrt(
+                                    (owned_p_center_x - island_p_center_x)**2 + 
+                                    (owned_p_center_y - island_p_center_y)**2
+                                )
+                                
+                                # 예: 특정 거리 이내의 섬만 공격 대상으로 간주 (예: 50 유닛)
+                                MAX_ISLAND_ATTACK_RANGE = 50 
+                                if distance_to_island <= MAX_ISLAND_ATTACK_RANGE:
+                                    can_attack_island = True
+                                    # print(f"    섬 공격 가능: {owned_p.id} (해안) -> {p.id} (섬), 거리: {distance_to_island:.2f}")
+                                    break # 공격 가능한 섬을 찾았으면 더 볼 필요 없음
+                        
+                        if can_attack_directly or can_attack_island:
+                            if p not in potential_enemy_targets: # 중복 추가 방지
+                                potential_enemy_targets.append(p)
                 
                 actual_attack_targets = []
                 if potential_enemy_targets:
@@ -1574,7 +1621,7 @@ while running:
                         # print(f"    적 목표 정렬 스킵 (유휴 군대 없음 또는 현재 프로빈스 정보 없음)")
                     actual_attack_targets = list(potential_enemy_targets) # 모든 잠재적 적 목표를 실제 목표로 설정
                     if actual_attack_targets: # 실제 목표가 선정된 경우에만 로그 출력
-                        print(f"  선정된 적 공격 목표: {[t.id for t in actual_attack_targets]}")
+                        print(f"  선정된 적 공격 목표: {[t.id for t in actual_attack_targets]} (섬 포함 가능)")
 
                     # 적 공격 목표가 없다면 빈 땅 점령 목표 선정
                     if not actual_attack_targets: # 여기서 actual_attack_targets는 위에서 적 목표를 못 찾았을 경우 비어있을 수 있음
