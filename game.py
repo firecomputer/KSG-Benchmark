@@ -141,7 +141,7 @@ def draw_star(surface, color, center, radius):
 
 # black_dot_coordinates.json 파일에서 검은 점(육지) 좌표 로드
 try:
-    with open('../KSG Benchmark/black_dot_coordinates.json', 'r') as f:
+    with open('black_dot_coordinates.json', 'r') as f:
         black_dots_data = json.load(f)
 except FileNotFoundError:
     print("오류: black_dot_coordinates.json 파일을 찾을 수 없습니다.")
@@ -1408,6 +1408,7 @@ if provinces:
         # 사용 가능한 프로빈스 복사본 생성 (소유되지 않은 프로빈스만)
         available_provinces_for_spawn = [p for p in valid_start_provinces if p.owner is None]
         
+        country_colors = []
         for i in range(COUNTRY_COUNT):
             if not available_provinces_for_spawn:
                 game_logger.warning("경고: 모든 유효한 시작 프로빈스가 소진되었습니다. 추가 국가를 초기화할 수 없습니다.")
@@ -1452,8 +1453,19 @@ if provinces:
                     available_provinces_for_spawn.remove(start_province) # 선택된 프로빈스 제거
                 
                 # 무작위 색상 생성
-                start_r, start_g, start_b = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
+                for j in range(0,20000): # 20000d은 임의의 숫자. 추후 변경 가능
+                    color_not_accepted = False
+                    start_r, start_g, start_b = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
+                    for country_color in country_colors:
+                        rDiff = country_color[0]
+                        gDiff = country_color[1]
+                        bDiff = country_color[2]
+                        if(rDiff+gDiff+bDiff < 100):
+                            color_not_accepted = True
+                    if(color_not_accepted == False):
+                        break
                 start_color = (start_r, start_g, start_b)
+                country_colors.append(start_color)
                 
                 country_id_counter += 1
                 country_name = f"냥냥 왕국 {country_id_counter}"
