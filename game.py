@@ -9,6 +9,57 @@ import json
 import random
 from copy import copy
 import math # 거리 계산을 위해 math 모듈 추가
+import logging
+import os # for logging path
+import asyncio # 비동기 처리를 위해 추가
+
+# Gemini Agent Import
+try:
+    from gemini_agent import GeminiAgent
+except ImportError:
+    print("오류: gemini_agent.py를 찾을 수 없거나, 해당 모듈에 GeminiAgent 클래스가 없습니다.")
+    GeminiAgent = None # Define as None if import fails
+
+# --- 로깅 설정 ---
+# 게임 전체 로거
+game_logger = logging.getLogger('GameLogger')
+game_logger.setLevel(logging.INFO)
+
+# GeminiAgent 로거 (gemini_agent.py에서 설정된 로거를 가져오거나, 여기서 핸들러 추가)
+# gemini_agent.py에서 이미 파일 핸들러를 설정하고 있으므로, 여기서는 콘솔 핸들러만 추가하거나
+# game.py에서 파일 핸들러를 중앙 관리할 수 있습니다.
+# 여기서는 game.py가 gemini.log 파일 핸들러를 관리하도록 하고,
+# GeminiAgent 클래스 내에서는 getLogger만 사용하도록 하는 것이 좋습니다.
+# 하지만 gemini_agent.py가 독립적으로 실행될 수도 있으므로, 중복 방지 로직이 중요합니다.
+
+log_file_path_game = os.path.join(os.path.dirname(__file__), 'gemini.log') # game.py와 같은 디렉토리
+# 파일 핸들러 (기존 핸들러가 없거나, 다른 파일이면 추가)
+# game_logger와 gemini_agent_logger가 같은 파일을 사용하도록 설정
+if not any(isinstance(h, logging.FileHandler) and h.baseFilename == log_file_path_game for h in game_logger.handlers):
+    file_handler_game = logging.FileHandler(log_file_path_game, encoding='utf-8', mode='a') # append mode
+    formatter_game = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler_game.setFormatter(formatter_game)
+    game_logger.addHandler(file_handler_game)
+
+# GeminiAgent 로거에도 같은 파일 핸들러를 사용하도록 설정 (gemini_agent.py에서 설정 안했을 경우 대비)
+if GeminiAgent: # GeminiAgent가 성공적으로 import 되었을 때만
+    gemini_logger_instance = logging.getLogger('GeminiAgentLogger') # gemini_agent.py에서 사용하는 로거 이름
+    gemini_logger_instance.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == log_file_path_game for h in gemini_logger_instance.handlers):
+        # game_logger에 추가된 핸들러를 공유하거나 새로 만들 수 있음
+        # 여기서는 game_logger와 같은 핸들러를 사용하도록 함 (이미 위에서 생성)
+        if 'file_handler_game' in locals() and file_handler_game not in gemini_logger_instance.handlers:
+             gemini_logger_instance.addHandler(file_handler_game)
+    # 콘솔 핸들러 (디버깅용)
+    # console_handler = logging.StreamHandler()
+    # console_handler.setFormatter(formatter_game)
+    # if not gemini_logger_instance.handlers: # 콘솔 핸들러는 중복 추가될 수 있으므로 주의
+    #     gemini_logger_instance.addHandler(console_handler)
+    # if not game_logger.handlers:
+    #     game_logger.addHandler(console_handler)
+
+
+game_logger.info("게임 시작 및 로거 설정 완료.")
 
 # --- 게임 상수 설정 ---
 
@@ -20,7 +71,7 @@ SCREEN_HEIGHT = 964
 REAL_LENGTH_FACTOR = 1
 
 # 게임에 참여할 국가의 수
-COUNTRY_COUNT = 12
+COUNTRY_COUNT = 5
 
 # 실제 게임 그리드의 너비와 높이 (REAL_LENGTH_FACTOR에 따라 조정)
 REAL_WIDTH = round(SCREEN_WIDTH / REAL_LENGTH_FACTOR)
@@ -197,23 +248,54 @@ class Country:
     게임 내 국가를 나타내는 클래스.
     각 국가는 색상, 인구, GDP, 소유 프로빈스 등의 속성을 가집니다.
     """
-    def __init__(self, start_province, color, start_population, start_gdp):
+    def __init__(self, country_id, name, start_province, color, start_population, start_gdp):
         """
         Country 클래스의 생성자.
 
         Args:
+            country_id (int): 국가의 고유 ID.
+            name (str): 국가의 이름.
             start_province (Province): 국가가 시작할 프로빈스 객체.
             color (tuple): 국가의 고유 색상 RGB 튜플.
             start_population (int): 국가의 초기 인구.
             start_gdp (int): 국가의 초기 GDP.
         """
+        self.id = country_id
+        self.name = name # 국가 이름 추가
         self.color = color
         self.time_elapsed = 0  # 게임 시간/프레임 카운터
         self.owned_provinces = []  # 국가가 소유한 프로빈스 목록
         self.armies = [] # 국가가 소유한 군대 목록
         self.capital_province = start_province  # 국가의 수도 프로빈스
+        
+        self.allies = set() # 동맹 국가 Set (Country 객체 저장)
+        self.enemies = set() # 적대 국가 Set (Country 객체 저장)
+
+        # --- 반란 시스템 속성 ---
+        self.rebellion_risk = 0.05  # 기본 반란 위험도 (5%)
+        self.last_rebellion_turn = -1000 # 마지막 반란 발생 턴 (초기값은 아주 오래 전으로)
+        self.economic_stability = 1.0 # 경제 안정도 (0.0 ~ 1.0+), 높을수록 안정
+        # 반란 진압 후 안정화 기간 (턴 수)
+        self.rebellion_cooldown_period = 100 # 예: 100턴 (논리적 초 기준으로는 더 길게 설정 가능)
+        # --- 반란 시스템 속성 끝 ---
+        
+        # AI 에이전트 초기화
+        if GeminiAgent:
+            self.ai_agent = GeminiAgent() # 각 국가별 AI 에이전트
+            game_logger.info(f"국가 '{self.name}' AI 에이전트 초기화 완료.")
+        else:
+            self.ai_agent = None
+            game_logger.warning(f"국가 '{self.name}' AI 에이전트 초기화 실패 (GeminiAgent 모듈 로드 실패).")
+
+        # 예산 관련 변수 (AI가 결정)
+        self.budget_allocation = {"국방": 0.4, "경제": 0.3, "연구": 0.3} # 기본값
+        self.military_budget_ratio_ai = MILITARY_BUDGET_RATIO # AI 결정용 국방 예산 비율 (기본값 사용)
+        self.attack_ratio_ai = 0.5 # AI 결정용 공격 비율 (기본값: 50% 공격, 50% 방어)
+        self.attack_target_ai = None # AI 결정용 공격 대상 국가
+
         # When adding the first province, assign its initial population and GDP
         self.add_province(start_province, initial_population=start_population, initial_gdp=start_gdp)
+        game_logger.info(f"국가 '{self.name}' 생성 완료. 수도: {start_province.id if start_province else '없음'}, 인구: {start_population}, GDP: {start_gdp}")
 
     def add_province(self, province, initial_population=None, initial_gdp=None):
         """
@@ -423,23 +505,65 @@ class Country:
         actual_strength = strength
         if province.is_coastal:
             actual_strength = int(strength * 0.7)
-            print(f"해안 프로빈스에서 군대 생성량 30% 감소: {strength} -> {actual_strength}")
+            # print(f"해안 프로빈스에서 군대 생성량 30% 감소: {strength} -> {actual_strength}") # 로그로 대체
 
         required_population = actual_strength * POPULATION_COST_PER_STRENGTH
         required_gdp = actual_strength * GDP_COST_PER_STRENGTH
 
         # 1. 자원이 충분한지 먼저 확인합니다.
         if self.get_total_population() < required_population or self.get_total_gdp() < required_gdp:
+            game_logger.debug(f"국가 '{self.name}': 프로빈스 {province.id}에 군대 창설 실패 - 자원 부족 (요구 인구: {required_population}, 요구 GDP: {required_gdp})")
             return None
 
         # 2. 자원 차감을 시도합니다.
         if self.deduct_population(required_population) and self.deduct_gdp(required_gdp):
             new_army = Army(self, province, actual_strength)
             self.armies.append(new_army)
-            print(f"국가 {self.color}: 프로빈스 {province.id}에 {actual_strength:,}명 군대 창설! (GDP 기반)")
+            game_logger.info(f"국가 '{self.name}': 프로빈스 {province.id}에 {actual_strength:,}명 군대 창설! (GDP 기반)")
             return new_army
         else:
+            game_logger.warning(f"국가 '{self.name}': 프로빈스 {province.id}에 군대 창설 실패 - 자원 차감 실패")
             return None
+
+    def add_ally(self, other_country):
+        if other_country and other_country != self and other_country not in self.allies:
+            self.allies.add(other_country)
+            other_country.allies.add(self) # 상호 동맹
+            # 적대 관계였다면 해소
+            if other_country in self.enemies:
+                self.enemies.remove(other_country)
+                other_country.enemies.remove(self)
+            game_logger.info(f"외교: '{self.name}' 국가와 '{other_country.name}' 국가가 동맹을 맺었습니다.")
+            return True
+        return False
+
+    def remove_ally(self, other_country):
+        if other_country and other_country in self.allies:
+            self.allies.remove(other_country)
+            other_country.allies.remove(self) # 상호 동맹 해제
+            game_logger.info(f"외교: '{self.name}' 국가와 '{other_country.name}' 국가의 동맹이 해제되었습니다.")
+            return True
+        return False
+
+    def add_enemy(self, other_country):
+        if other_country and other_country != self and other_country not in self.enemies:
+            self.enemies.add(other_country)
+            other_country.enemies.add(self) # 상호 적대
+            # 동맹 관계였다면 해소
+            if other_country in self.allies:
+                self.allies.remove(other_country)
+                other_country.allies.remove(self)
+            game_logger.info(f"외교: '{self.name}' 국가가 '{other_country.name}' 국가에 선전포고했습니다!")
+            return True
+        return False
+
+    def remove_enemy(self, other_country): # 휴전 등으로 적대 관계 해소
+        if other_country and other_country in self.enemies:
+            self.enemies.remove(other_country)
+            other_country.enemies.remove(self) # 상호 적대 해제
+            game_logger.info(f"외교: '{self.name}' 국가와 '{other_country.name}' 국가가 휴전했습니다.")
+            return True
+        return False
 
     def get_border_provinces(self):
         """
@@ -1229,6 +1353,7 @@ for x in range(REAL_WIDTH):
         # 아직 방문하지 않았고, 육지 타일에서만 프로빈스 생성 시도
         if (x, y) not in visited_tiles_for_province_creation and (x, y) in land_coords:
             create_province(x, y, min_tiles=1) # min_tiles를 1로 변경하여 모든 육지 타일이 프로빈스에 포함되도록 함
+game_logger.info(f"프로빈스 생성 완료. 총 프로빈스 수: {len(provinces)}")
 
 # 프로빈스 간의 인접 관계 설정 (border_provinces) 및 섬/해안 여부 판단
 for p1 in provinces:
@@ -1273,162 +1398,401 @@ initial_gdp = 1000000
 countries = [] # 국가 객체들을 저장할 리스트
 
 # COUNTRY_COUNT 만큼의 국가 인스턴스 생성 및 초기화
-# 각 국가는 무작위 육지 프로빈스를 시작 프로빈스로 가짐
+# 각 국가는 다른 국가들과 일정한 거리를 유지하며 스폰되도록 수정
+country_id_counter = 0
 if provinces:
-    # 육지 프로빈스만 필터링 (land_coords에 속한 타일로만 구성된 프로빈스)
-    # 모든 타일이 land_coords에 있어야 육지 프로빈스로 간주하고, 섬이 아니어야 함
+    # 육지 프로빈스만 필터링 (land_coords에 속한 타일로만 구성된 프로빈스, 섬 제외)
     valid_start_provinces = [p for p in provinces if all((t.x, t.y) in land_coords for t in p.tiles) and not p.is_island]
     
     if valid_start_provinces:
+        # 사용 가능한 프로빈스 복사본 생성 (소유되지 않은 프로빈스만)
+        available_provinces_for_spawn = [p for p in valid_start_provinces if p.owner is None]
+        
         for i in range(COUNTRY_COUNT):
-            # 아직 소유되지 않은, 섬이 아닌 육지 프로빈스 중에서 선택
-            available_provinces = [p for p in valid_start_provinces if p.owner is None] # valid_start_provinces에서 이미 섬이 걸러짐
-            if available_provinces:
-                start_province = random.choice(available_provinces)
+            if not available_provinces_for_spawn:
+                game_logger.warning("경고: 모든 유효한 시작 프로빈스가 소진되었습니다. 추가 국가를 초기화할 수 없습니다.")
+                break
+
+            start_province = None
+            if not countries: # 첫 번째 국가인 경우
+                if available_provinces_for_spawn: # 선택할 프로빈스가 있는지 확인
+                    start_province = random.choice(available_provinces_for_spawn)
+                else: # 선택할 프로빈스가 없으면 루프 종료
+                    game_logger.warning("경고: 첫 번째 국가를 위한 시작 프로빈스가 없습니다.")
+                    break 
+            else:
+                # 기존 국가들과 가장 멀리 떨어진 프로빈스 선택
+                best_province_candidate = None
+                max_overall_min_distance = -1
+
+                for candidate_province in available_provinces_for_spawn:
+                    candidate_center = candidate_province.get_center_coordinates()
+                    current_province_min_distance_to_capitals = float('inf')
+                    
+                    # 이 후보 프로빈스와 기존 모든 국가 수도 간의 최소 거리 계산
+                    for existing_country in countries:
+                        if existing_country.capital_province: # 수도가 있어야 거리 계산 가능
+                            existing_capital_center = existing_country.capital_province.get_center_coordinates()
+                            distance = math.sqrt(
+                                (candidate_center[0] - existing_capital_center[0])**2 +
+                                (candidate_center[1] - existing_capital_center[1])**2
+                            )
+                            current_province_min_distance_to_capitals = min(current_province_min_distance_to_capitals, distance)
+                    
+                    # 이 후보 프로빈스의 '기존 수도들과의 최소 거리'가
+                    # 지금까지 고려된 다른 후보 프로빈스들의 '기존 수도들과의 최소 거리'보다 크면 업데이트
+                    if current_province_min_distance_to_capitals > max_overall_min_distance:
+                        max_overall_min_distance = current_province_min_distance_to_capitals
+                        best_province_candidate = candidate_province
+                
+                start_province = best_province_candidate
+
+            if start_province:
+                if start_province in available_provinces_for_spawn: # 아직 사용 가능한지 재확인 (동시성 문제 방지용이지만 여기선 단일 스레드)
+                    available_provinces_for_spawn.remove(start_province) # 선택된 프로빈스 제거
                 
                 # 무작위 색상 생성
-                start_r, start_g, start_b = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+                start_r, start_g, start_b = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
                 start_color = (start_r, start_g, start_b)
+                
+                country_id_counter += 1
+                country_name = f"냥냥 왕국 {country_id_counter}"
 
-                # 새로운 국가를 생성하여 리스트에 추가
-                # initial_population과 initial_gdp는 이제 시작 프로빈스에 할당됩니다.
-                countries.append(Country(start_province, start_color, initial_population, initial_gdp))
+                countries.append(Country(country_id_counter, country_name, start_province, start_color, initial_population, initial_gdp))
+                game_logger.info(f"국가 '{country_name}' 생성: 프로빈스 {start_province.id}, 최소 거리 유지값: {max_overall_min_distance if i > 0 else 'N/A'}")
             else:
-                print("경고: 모든 육지 프로빈스가 이미 소유되었습니다. 추가 국가를 초기화할 수 없습니다.")
-                break # 더 이상 초기화할 프로빈스가 없으므로 루프 종료
+                # 적절한 프로빈스를 찾지 못한 경우 (예: 모든 남은 프로빈스가 너무 가깝거나, 후보가 없는 경우)
+                # fallback: 남은 프로빈스 중 무작위로 선택 (만약 있다면)
+                if available_provinces_for_spawn:
+                    game_logger.warning(f"경고: {i+1}번째 국가를 위한 최적의 시작 프로빈스를 찾지 못했습니다. 남은 후보 중 무작위 선택.")
+                    start_province = random.choice(available_provinces_for_spawn)
+                    available_provinces_for_spawn.remove(start_province)
+                    
+                    start_r, start_g, start_b = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
+                    start_color = (start_r, start_g, start_b)
+                    country_id_counter += 1
+                    country_name = f"냥냥 왕국 {country_id_counter}"
+                    countries.append(Country(country_id_counter, country_name, start_province, start_color, initial_population, initial_gdp))
+                    game_logger.info(f"  ㄴ fallback: '{country_name}'을(를) 남은 프로빈스 {start_province.id}에 생성.")
+                else:
+                    game_logger.warning("경고: 더 이상 국가를 생성할 프로빈스가 없습니다. 국가 생성을 중단합니다.")
+                    break 
     else:
-        print("경고: 생성된 유효한 시작 프로빈스가 없습니다. 국가를 초기화할 수 없습니다.")
+        game_logger.warning("경고: 생성된 유효한 시작 프로빈스가 없습니다. 국가를 초기화할 수 없습니다.")
 else:
-    print("경고: 생성된 프로빈스가 없습니다. 국가를 초기화할 수 없습니다.")
+    game_logger.warning("경고: 생성된 프로빈스가 없습니다. 국가를 초기화할 수 없습니다.")
+
+game_logger.info(f"국가 생성 완료. 총 국가 수: {len(countries)}")
+
+
+# --- AI용 게임 상태 정보 수집 함수 ---
+def get_game_state_for_ai(current_country, all_countries, game_turn):
+    """AI 에이전트에게 전달할 게임 상태 정보를 구성합니다."""
+    all_nations_details = []
+    for c in all_countries:
+        relation_to_current = "자신"
+        if c != current_country:
+            if c in current_country.allies:
+                relation_to_current = "동맹"
+            elif c in current_country.enemies:
+                relation_to_current = "적대"
+            else:
+                relation_to_current = "중립"
+        
+        nation_detail = {
+            "name": c.name,
+            "population": c.get_total_population(),
+            "gdp": c.get_total_gdp(),
+            "province_count": len(c.owned_provinces),
+            "army_count": len(c.armies),
+            "capital_province_id": c.capital_province.id if c.capital_province else None,
+            "allies": [ally.name for ally in c.allies],
+            "enemies": [enemy.name for enemy in c.enemies],
+            "relation_to_me": relation_to_current # 현재 AI 국가 기준 관계
+        }
+        all_nations_details.append(nation_detail)
+
+    my_bordering_nations_detail = []
+    for p in current_country.owned_provinces:
+        for bp in p.border_provinces:
+            if bp.owner and bp.owner != current_country:
+                # all_nations_details에서 해당 국가 정보 찾기
+                border_nation_info = next((n for n in all_nations_details if n["name"] == bp.owner.name), None)
+                if border_nation_info and border_nation_info not in my_bordering_nations_detail: # 중복 방지
+                    my_bordering_nations_detail.append(border_nation_info)
+    
+    game_state = {
+        "current_turn": game_turn,
+        "my_nation_name": current_country.name,
+        "all_nations_details": all_nations_details,
+        "my_nation_bordering_nations_detail": my_bordering_nations_detail,
+        "global_events": [] # 현재는 사용 안함
+    }
+    return game_state
 
 # --- 게임 루프 ---
 running = True
+game_current_turn = 0 # 전체 게임 턴 카운터
 while running:
     # 이벤트 처리
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False  # 창 닫기 버튼 클릭 시 게임 종료
 
-    # 각 국가에 대한 게임 로직 업데이트
+        # 각 국가에 대한 게임 로직 업데이트
+    game_current_turn += 1 # 매 프레임마다 턴 증가 (또는 GAME_TICKS_PER_LOGICAL_SECOND 마다)
+    if game_current_turn % (GAME_TICKS_PER_LOGICAL_SECOND * 5) == 0: # 예: 5초마다 AI 결정
+        game_logger.info(f"--- 게임 턴 {game_current_turn // GAME_TICKS_PER_LOGICAL_SECOND} 시작 ---")
+
     for country in countries:
         # 시간 경과에 따른 국가 스탯 업데이트
         country.time_elapsed += 1
         
         # 매 GAME_TICKS_PER_LOGICAL_SECOND 틱마다 경제 및 군사 로직 처리
         if country.time_elapsed % GAME_TICKS_PER_LOGICAL_SECOND == 0:
+            current_logical_second = country.time_elapsed // GAME_TICKS_PER_LOGICAL_SECOND
+            game_logger.debug(f"국가 '{country.name}' 틱 {country.time_elapsed} (논리적 초: {current_logical_second}) 경제/군사/반란 업데이트 시작")
+
             # 1. 인구 및 GDP 성장 (퍼센트 + 고정값)
+            economy_investment_ratio = country.budget_allocation.get("경제", 0.3)
+            gdp_growth_rate = 0.05 * (1 + economy_investment_ratio * 0.5) 
+            
             for p in country.owned_provinces:
-                p.population += int(p.population * 0.01)  # 프로빈스 인구 1% 성장 (주기가 짧아졌으므로 성장률 조정 필요시 고려)
-                p.gdp += int(p.gdp * 0.05)              # 프로빈스 GDP 5% 성장 (주기가 짧아졌으므로 성장률 조정 필요시 고려)
-            country.add_gdp(FIXED_GDP_BOOST_PER_TICK) # 고정 GDP 추가 (틱당)
+                p.population += int(p.population * 0.01)
+                p.gdp += int(p.gdp * gdp_growth_rate)
+            country.add_gdp(FIXED_GDP_BOOST_PER_TICK * (1 + economy_investment_ratio))
+            game_logger.debug(f"국가 '{country.name}': 인구/GDP 성장 완료. 경제 투자율: {economy_investment_ratio*100:.1f}%, GDP 성장률: {gdp_growth_rate*100:.1f}%")
+
+            # --- 반란 시스템 업데이트 ---
+            # 경제 안정도 업데이트 (경제 투자 비율에 따라)
+            # 경제 투자 비율이 0.3 (30%)일 때 안정도 1.0 기준
+            country.economic_stability = (economy_investment_ratio / 0.3) * 1.0 
+            country.economic_stability = max(0.1, min(country.economic_stability, 1.5)) # 최소 0.1, 최대 1.5
+
+            # 반란 위험도 계산
+            base_risk = 0.01 # 기본 최소 위험
+            economic_factor = (1.0 / (country.economic_stability + 0.01)) # 경제 안정도가 낮을수록 위험 증가 (0.01은 분모 0 방지)
+            
+            # 경제 예산이 매우 낮으면 (예: 10% 미만) 위험도 급증
+            if economy_investment_ratio < 0.1:
+                economic_factor *= 5
+            elif economy_investment_ratio < 0.2:
+                economic_factor *= 2
+            
+            country.rebellion_risk = base_risk * economic_factor
+            
+            # 마지막 반란 이후 쿨다운 적용
+            if game_current_turn - country.last_rebellion_turn < country.rebellion_cooldown_period:
+                # 쿨다운 기간에는 위험도를 크게 낮춤
+                # 남은 쿨다운 기간에 비례하여 점진적으로 회복하도록 수정 가능
+                time_since_rebellion = game_current_turn - country.last_rebellion_turn
+                cooldown_factor = time_since_rebellion / country.rebellion_cooldown_period # 0에서 1로 증가
+                # 초기에는 매우 낮고, 쿨다운 종료 시점에 가까워질수록 원래 위험도에 근접
+                country.rebellion_risk *= (0.1 + 0.9 * cooldown_factor) 
+                country.rebellion_risk = max(0.001, country.rebellion_risk) # 최소 위험도 보장
+            
+            country.rebellion_risk = min(country.rebellion_risk, 0.5) # 최대 위험도 50%로 제한
+            game_logger.debug(f"국가 '{country.name}': 경제 안정도 {country.economic_stability:.2f}, 반란 위험도 {country.rebellion_risk:.4f}")
+
+            # 반란 발생 처리
+            if random.random() < country.rebellion_risk and len(country.owned_provinces) > 1: # 최소 1개 프로빈스는 남겨둠
+                # 반란 발생!
+                rebel_province_count = random.randint(1, max(1, len(country.owned_provinces) // 3)) # 최대 1/3 프로빈스 반란
+                rebel_provinces = random.sample(country.owned_provinces, min(rebel_province_count, len(country.owned_provinces) -1))
+                
+                game_logger.warning(f"*** 반란 발생! 국가 '{country.name}'에서 {len(rebel_provinces)}개 프로빈스 반란! ***")
+                for p_rebel in rebel_provinces:
+                    if p_rebel == country.capital_province: # 수도가 반란하면 수도 이전
+                        country.remove_province(p_rebel) # 먼저 국가에서 제거
+                        # 수도 이전 로직은 remove_province 내에서 처리됨
+                        game_logger.warning(f"  ㄴ 수도 {p_rebel.id} 포함 반란! 수도 이전됨.")
+                    else:
+                        country.remove_province(p_rebel)
+                    
+                    # 반란 프로빈스는 중립화 (또는 새로운 반란군 세력으로 만들 수 있음)
+                    p_rebel.owner = None 
+                    p_rebel.change_color(black) # 중립 색상
+                    # 반란 프로빈스의 군대 처리 (해당 프로빈스 주둔군은 소멸 또는 반란군으로 전환)
+                    armies_in_rebel_province = [army for army in country.armies if army.current_province == p_rebel]
+                    for army_rebel in armies_in_rebel_province:
+                        if army_rebel in country.armies:
+                            country.armies.remove(army_rebel)
+                        game_logger.info(f"  ㄴ 반란 프로빈스 {p_rebel.id}의 군대 소멸.")
+                    
+                    game_logger.info(f"  ㄴ 프로빈스 {p_rebel.id}가 중립화되었습니다.")
+
+                country.last_rebellion_turn = game_current_turn # 마지막 반란 턴 업데이트
+                # 반란 직후에는 국가 전체의 반란 위험도를 일시적으로 더 낮출 수 있음 (이미 쿨다운으로 처리 중)
+                # country.rebellion_risk *= 0.1 
+            # --- 반란 시스템 업데이트 끝 ---
 
             # 2. 군대 유지비 계산 및 차감
             total_army_strength = country.get_total_army_strength()
-            maintenance_cost = total_army_strength * ARMY_MAINTENANCE_PER_STRENGTH_PER_TICK # 틱당 유지비
+            maintenance_cost = total_army_strength * ARMY_MAINTENANCE_PER_STRENGTH_PER_TICK
             
             if maintenance_cost > 0:
-                # print(f"{country.color} 국가: 군대 유지비 {maintenance_cost:.2f} GDP 소모 시도 (총 병력: {total_army_strength}, 현재 GDP: {country.get_total_gdp()})")
                 if not country.deduct_gdp(maintenance_cost):
-                    # print(f"{country.color} 국가: 군대 유지비 {maintenance_cost:.1f} GDP 소모 실패. GDP 부족.")
-                    # GDP가 부족하여 유지비를 모두 지불하지 못한 경우, GDP는 0이 될 수 있음 (deduct_gdp 내부 처리)
-                    pass # 이미 deduct_gdp에서 가능한 만큼 차감됨
-                # else:
-                    # print(f"{country.color} 국가: 군대 유지비 {maintenance_cost:.1f} GDP 소모 완료. 남은 GDP: {country.get_total_gdp()}")
-
+                    game_logger.warning(f"국가 '{country.name}': 군대 유지비 {maintenance_cost:.1f} GDP 소모 실패. GDP 부족.")
+                else:
+                    game_logger.debug(f"국가 '{country.name}': 군대 유지비 {maintenance_cost:.1f} GDP 소모 완료. 남은 GDP: {country.get_total_gdp()}")
 
             # 3. GDP 확인 및 군대 자동 해체
             current_gdp = country.get_total_gdp()
-            # print(f"{country.color} 국가: 유지비 처리 후 GDP: {current_gdp}, 임계값: {GDP_LOW_THRESHOLD}")
-
             while current_gdp < GDP_LOW_THRESHOLD and country.armies:
-                country.armies.sort(key=lambda army: army.strength) # 병력이 적은 순으로 정렬
-                if not country.armies: # 정렬 후 다시 한번 확인
-                    break
-                
-                disbanded_army = country.armies.pop(0) # 가장 약한 군대 제거
-                print(f"{country.color} 국가: GDP 부족 ({current_gdp} < {GDP_LOW_THRESHOLD})으로 가장 약한 군대 (병력: {disbanded_army.strength})를 해체합니다.")
-                
-                # 군대 해체 후에는 국가의 총 GDP가 변하지 않으므로, current_gdp를 다시 가져올 필요는 없음.
-                # 루프는 country.armies가 비거나 current_gdp가 임계값 이상이 될 때까지 계속됨.
-                # 하지만, 만약 군대 해체가 GDP에 영향을 준다면 여기서 추가 로직 구현 가능.
-                # 현재 로직에서는 영향 없으므로, 다음 반복에서 같은 current_gdp로 다시 검사.
-                # 만약 모든 군대를 해체해도 GDP가 임계값 미만이면 루프 종료.
-            # 군대 창설 로직: 책정된 군사 예산 내에서 최대한 생성 (매 60프레임마다)
-            if len(country.armies) < 5:  # 최소 군대 수 유지
-                total_gdp = country.get_total_gdp()
-                military_budget_gdp = total_gdp * MILITARY_BUDGET_RATIO
-                
-                for attempt in range(min(MAX_ARMIES_PER_TURN_BUDGET, 3)):  # 시도 횟수 제한
-                    if len(country.armies) >= 20:  # 최대 군대 수 제한
-                        break
-                    
-                    # GDP 기반 군대 규모 계산
-                    base_strength = ARMY_BASE_STRENGTH + int(total_gdp * GDP_STRENGTH_MULTIPLIER)
-                    army_strength = min(base_strength, ARMY_MAX_STRENGTH)
-                    army_cost = army_strength * GDP_COST_PER_STRENGTH
-                    
-                    if military_budget_gdp >= army_cost:
-                        suitable_provinces = [p for p in country.owned_provinces 
-                                            if (p.is_island or country.is_province_connected_to_capital(p))]
-                        
-                        if suitable_provinces:
-                            chosen_province = random.choice(suitable_provinces)
-                            new_army = country.create_army(chosen_province, army_strength)
-                            if new_army:
-                                military_budget_gdp -= army_cost
-                            else:
-                                break
-                        else:
-                            break
-                    else:
-                        break
-            # print(f"{country.color} 국가: 군사 예산 {military_budget_gdp:.0f} GDP 책정 (총 GDP: {country.get_total_gdp()})")
+                country.armies.sort(key=lambda army: army.strength)
+                if not country.armies: break
+                disbanded_army = country.armies.pop(0)
+                game_logger.info(f"국가 '{country.name}': GDP 부족 ({current_gdp} < {GDP_LOW_THRESHOLD})으로 군대 (병력: {disbanded_army.strength}) 해체.")
+            
+            # 4. 군대 창설 로직 (AI가 결정한 국방 예산 비율 사용)
+            total_gdp = country.get_total_gdp()
+            # military_budget_gdp = total_gdp * country.military_budget_ratio_ai # AI 결정 사용
+            # AI가 결정한 국방 예산 비율을 사용
+            actual_military_budget_ratio = country.budget_allocation.get("국방", country.military_budget_ratio_ai)
+            military_budget_gdp = total_gdp * actual_military_budget_ratio
+
+            game_logger.debug(f"국가 '{country.name}': 군대 창설 시도. 국방 예산 비율: {actual_military_budget_ratio*100:.1f}%, 가용 예산 GDP: {military_budget_gdp:.0f}")
 
             population_cost_one_army = POPULATION_COST_PER_STRENGTH * ARMY_BASE_STRENGTH
             gdp_cost_one_army = GDP_COST_PER_STRENGTH * ARMY_BASE_STRENGTH
-            
             armies_created_this_turn = 0
-            # max_armies_per_turn 상수는 MAX_ARMIES_PER_TURN_BUDGET 으로 변경됨
 
             while military_budget_gdp >= gdp_cost_one_army and \
                   country.owned_provinces and \
-                  armies_created_this_turn < MAX_ARMIES_PER_TURN_BUDGET:
+                  armies_created_this_turn < MAX_ARMIES_PER_TURN_BUDGET and \
+                  len(country.armies) < 20: # 최대 군대 수 제한
 
-                # 실제 국가 자원이 군대 생성 비용을 감당할 수 있는지 확인
                 if country.get_total_population() < population_cost_one_army or \
                    country.get_total_gdp() < gdp_cost_one_army:
-                    # print(f"{country.color} 국가: 실제 자원 부족으로 군대 생성 중단 (인구: {country.get_total_population()}, GDP: {country.get_total_gdp()})")
+                    game_logger.debug(f"국가 '{country.name}': 실제 자원 부족으로 군대 생성 중단.")
                     break
 
-                # 군대 생성 가능한 프로빈스 선택 (수도 연결 또는 섬)
-                eligible_provinces = [
-                    p for p in country.owned_provinces
-                    if (p.is_island or country.is_province_connected_to_capital(p))
-                ]
-                
+                eligible_provinces = [p for p in country.owned_provinces if (p.is_island or country.is_province_connected_to_capital(p))]
                 if not eligible_provinces:
-                    # print(f"{country.color} 국가: 군대 생성 가능한 프로빈스 없음. 생성 중단.")
+                    game_logger.debug(f"국가 '{country.name}': 군대 생성 가능한 프로빈스 없음.")
                     break
 
                 spawn_province = random.choice(eligible_provinces)
-                
                 created_army = country.create_army(spawn_province, ARMY_BASE_STRENGTH)
 
                 if created_army:
-                    # print(f"{country.color} 국가: 예산으로 군대 생성 성공! (프로빈스: {spawn_province.id}, 병력: {created_army.strength}). 남은 예산 {military_budget_gdp - gdp_cost_one_army:.0f} GDP")
-                    military_budget_gdp -= gdp_cost_one_army # 예산에서 비용 차감
+                    military_budget_gdp -= gdp_cost_one_army
                     armies_created_this_turn += 1
+                    game_logger.info(f"국가 '{country.name}': 예산으로 군대 생성 (프로빈스: {spawn_province.id}, 병력: {created_army.strength}). 남은 예산 {military_budget_gdp:.0f} GDP")
                 else:
-                    # print(f"{country.color} 국가: create_army 실패 (프로빈스: {spawn_province.id}). 군대 생성 중단.")
-                    break # create_army 실패 시 루프 중단
+                    game_logger.warning(f"국가 '{country.name}': create_army 실패 (프로빈스: {spawn_province.id}).")
+                    break
             
-            # if armies_created_this_turn > 0:
-                # print(f"{country.color} 국가: 이번 턴에 총 {armies_created_this_turn}개 군대 생성 시도 완료.")
-            # print(f"{country.color} 국가: 군대 생성 후 최종 남은 예산 {military_budget_gdp:.0f} GDP")
+            if armies_created_this_turn > 0:
+                game_logger.info(f"국가 '{country.name}': 이번 턴에 총 {armies_created_this_turn}개 군대 생성 완료.")
 
-        # 고립된 지역의 군대 약화 처리
-        # (매 프레임마다 체크할 필요는 없으므로, 1초 주기 로직으로 옮기거나 빈도를 조절할 수 있습니다)
-        # 현재는 매 프레임마다 실행되도록 유지합니다. 필요시 country.time_elapsed % N == 0 조건 추가 가능.
+        # --- AI 의사 결정 (예: 5초마다) ---
+        # 비동기 종합 결정 로직으로 변경
+        ai_decision_interval = GAME_TICKS_PER_LOGICAL_SECOND * 10 # AI 결정 주기 (예: 10초)
+        # 모든 국가에 대해 한 번에 AI 결정을 요청하고 처리하기 위한 플래그 또는 조건
+        # 여기서는 game_current_turn을 사용하여 특정 턴마다 모든 AI의 결정을 한 번에 처리
+        if game_current_turn > 0 and game_current_turn % ai_decision_interval == 0:
+            game_logger.info(f"===== 전체 AI 국가 의사결정 시작 (게임 턴: {game_current_turn}) =====")
+            
+            async def get_all_ai_decisions():
+                tasks = []
+                for c_ai in countries:
+                    if c_ai.ai_agent:
+                        current_game_state_for_ai = get_game_state_for_ai(c_ai, countries, game_current_turn)
+                        # 종합 결정에 필요한 옵션들 준비
+                        war_opts = [other_c.name for other_c in countries if other_c != c_ai and other_c not in c_ai.allies and other_c not in c_ai.enemies]
+                        alliance_opts = [other_c.name for other_c in countries if other_c != c_ai and other_c not in c_ai.allies and other_c not in c_ai.enemies]
+                        truce_opts = [enemy.name for enemy in c_ai.enemies]
+                        budget_ref = c_ai.get_total_gdp() * 0.2 # 예산 편성 기준점 (예: GDP의 20%)
+
+                        tasks.append(c_ai.ai_agent.get_comprehensive_decision_async(
+                            current_game_state_for_ai,
+                            budget_ref,
+                            war_opts,
+                            alliance_opts,
+                            truce_opts
+                        ))
+                    else:
+                        # AI 에이전트가 없는 경우, 기본 결정 반환 (또는 None 처리)
+                        default_decision = {
+                            "budget": {"defense_ratio": 0.4, "economy_ratio": 0.3, "research_ratio": 0.3, "reason": "기본 예산"},
+                            "attack_strategy": {"target_nation": "없음", "attack_ratio": 0.5, "reason": "기본 전략"},
+                            "declare_war": {"target_nation": "아니오", "reason": "기본"},
+                            "form_alliance": {"target_nation": "아니오", "reason": "기본"},
+                            "offer_truce": {"target_nation": "아니오", "reason": "기본"}
+                        }
+                        # asyncio.Future를 만들어 즉시 결과를 설정하거나, 단순 리스트에 추가 후 처리
+                        future = asyncio.Future()
+                        future.set_result(default_decision)
+                        tasks.append(future)
+                
+                return await asyncio.gather(*tasks)
+
+            all_decisions = asyncio.run(get_all_ai_decisions())
+
+            for i, country_obj in enumerate(countries):
+                if country_obj.ai_agent and i < len(all_decisions):
+                    decisions = all_decisions[i]
+                    game_logger.info(f"--- 국가 '{country_obj.name}' AI 종합 결정 적용 시작 ---")
+                    game_logger.info(f"AI 종합 결정 내용 ({country_obj.name}): {decisions}")
+
+                    # 1. 예산 편성 적용
+                    budget_decision = decisions.get("budget", {})
+                    country_obj.budget_allocation = {
+                        "국방": budget_decision.get("defense_ratio", 0.4),
+                        "경제": budget_decision.get("economy_ratio", 0.3),
+                        "연구": budget_decision.get("research_ratio", 0.3)
+                    }
+                    game_logger.info(f"AI 결정 ({country_obj.name}): 예산 편성 = {country_obj.budget_allocation}, 이유 = {budget_decision.get('reason', 'N/A')}")
+
+                    # 2. 공격-방어 전략 적용
+                    attack_strategy = decisions.get("attack_strategy", {})
+                    country_obj.attack_ratio_ai = attack_strategy.get("attack_ratio", 0.5)
+                    attack_target_name = attack_strategy.get("target_nation")
+                    if attack_target_name and attack_target_name.lower() != "없음":
+                        country_obj.attack_target_ai = next((c for c in countries if c.name == attack_target_name), None)
+                    else:
+                        country_obj.attack_target_ai = None
+                    game_logger.info(f"AI 결정 ({country_obj.name}): 공격 대상 = {country_obj.attack_target_ai.name if country_obj.attack_target_ai else '없음'}, 공격 비율 = {country_obj.attack_ratio_ai:.2f}, 이유 = {attack_strategy.get('reason', 'N/A')}")
+
+                    # 3. 선전포고 적용
+                    declare_war_decision = decisions.get("declare_war", {})
+                    war_target_name = declare_war_decision.get("target_nation")
+                    if war_target_name and war_target_name.lower() != "아니오" and war_target_name.lower() != "없음":
+                        target_c_obj = next((c for c in countries if c.name == war_target_name), None)
+                        if target_c_obj and target_c_obj != country_obj and target_c_obj not in country_obj.enemies: # 이미 적이 아닌 경우에만
+                            country_obj.add_enemy(target_c_obj)
+                            game_logger.info(f"AI 결정 ({country_obj.name}): '{war_target_name}'에 선전포고. 이유: {declare_war_decision.get('reason', 'N/A')}")
+                    elif war_target_name and (war_target_name.lower() == "아니오" or war_target_name.lower() == "없음"):
+                         game_logger.info(f"AI 결정 ({country_obj.name}): 선전포고하지 않음. 이유: {declare_war_decision.get('reason', 'N/A')}")
+
+
+                    # 4. 동맹 결정 적용
+                    form_alliance_decision = decisions.get("form_alliance", {})
+                    alliance_target_name = form_alliance_decision.get("target_nation")
+                    if alliance_target_name and alliance_target_name.lower() != "아니오" and alliance_target_name.lower() != "없음":
+                        target_c_obj = next((c for c in countries if c.name == alliance_target_name), None)
+                        if target_c_obj and target_c_obj != country_obj and target_c_obj not in country_obj.allies and target_c_obj not in country_obj.enemies: # 동맹/적이 아닌 경우
+                            country_obj.add_ally(target_c_obj)
+                            game_logger.info(f"AI 결정 ({country_obj.name}): '{alliance_target_name}'와 동맹 시도. 이유: {form_alliance_decision.get('reason', 'N/A')}")
+                    elif alliance_target_name and (alliance_target_name.lower() == "아니오" or alliance_target_name.lower() == "없음"):
+                        game_logger.info(f"AI 결정 ({country_obj.name}): 동맹 맺지 않음. 이유: {form_alliance_decision.get('reason', 'N/A')}")
+                    
+                    # 5. 휴전 결정 적용
+                    offer_truce_decision = decisions.get("offer_truce", {})
+                    truce_target_name = offer_truce_decision.get("target_nation")
+                    if truce_target_name and truce_target_name.lower() != "아니오" and truce_target_name.lower() != "없음":
+                        target_c_obj = next((c for c in countries if c.name == truce_target_name), None)
+                        if target_c_obj and target_c_obj in country_obj.enemies: # 현재 적대 관계일 때만
+                            country_obj.remove_enemy(target_c_obj) # 휴전
+                            game_logger.info(f"AI 결정 ({country_obj.name}): '{truce_target_name}'와 휴전 시도. 이유: {offer_truce_decision.get('reason', 'N/A')}")
+                    elif truce_target_name and (truce_target_name.lower() == "아니오" or truce_target_name.lower() == "없음"):
+                         game_logger.info(f"AI 결정 ({country_obj.name}): 휴전하지 않음. 이유: {offer_truce_decision.get('reason', 'N/A')}")
+                    game_logger.info(f"--- 국가 '{country_obj.name}' AI 종합 결정 적용 완료 ---")
+            game_logger.info(f"===== 전체 AI 국가 의사결정 완료 (게임 턴: {game_current_turn}) =====")
+
+
+        # 고립된 지역의 군대 약화 처리 (기존 로직 유지)
         isolated_provinces = country.get_isolated_provinces()
         for province in isolated_provinces:
             # 해당 프로빈스에 있는 군대들을 약화시킴
@@ -1473,25 +1837,58 @@ while running:
             if invalid_army in country.armies:
                 country.armies.remove(invalid_army)
 
-        # --- 국가 AI: 작전 계획 및 군대 할당 (공격/방어 그룹 재도입) ---
-        MIN_ARMIES_FOR_OPERATION = 3 
-        MIN_STRENGTH_FOR_SINGLE_ARMY_OPERATION = ARMY_BASE_STRENGTH * 2.5 # 단일/소수 군대 작전 위한 최소 총 병력
-        OPERATION_PLAN_INTERVAL = GAME_TICKS_PER_LOGICAL_SECOND / 2  # 더 자주 작전 계획 (기존 /3에서 /2로)
+        # --- 국가 AI: 작전 계획 및 군대 할당 (AI 결정 반영) ---
+        # MIN_ARMIES_FOR_OPERATION = 3 
+        # MIN_STRENGTH_FOR_SINGLE_ARMY_OPERATION = ARMY_BASE_STRENGTH * 2.5
+        # OPERATION_PLAN_INTERVAL = GAME_TICKS_PER_LOGICAL_SECOND / 2 # 기존 AI 로직 주기
+        # AI 결정 주기는 위에서 별도로 처리 (ai_decision_interval)
+        # 여기서는 AI가 결정한 attack_ratio_ai 와 attack_target_ai를 사용하도록 수정
 
-        if country.time_elapsed % OPERATION_PLAN_INTERVAL == 0:
-            # 더 적극적인 방어 임무 할당 (더 자주 실행)
-            country.assign_defense_missions()
+        # 매 프레임 또는 짧은 주기마다 군대 운용 업데이트 (기존 로직 기반, AI 결정 활용)
+        # 예: 매초마다 군대 운용 업데이트
+        if country.time_elapsed % GAME_TICKS_PER_LOGICAL_SECOND == 0:
+            game_logger.debug(f"국가 '{country.name}' 군대 운용 업데이트 시작. 공격 목표 AI: {country.attack_target_ai.name if country.attack_target_ai else '없음'}, 공격 비율 AI: {country.attack_ratio_ai:.2f}")
             
-            # 유휴 군대 선정 시 방어/주둔 임무 중인 군대는 제외하되, 전투 중인 군대는 포함하지 않음
-            # 빈 땅을 점령 중인 군대도 유휴 군대로 간주하여 추가 임무 할당 가능
-            idle_armies = [
-                army for army in country.armies 
-                if army.strength > 0 and army.mission_type not in ["defense", "garrison"] and not army.in_battle and
-                (not army.target_province or 
-                 (army.target_province and army.target_province.owner is None))  # 목표가 없거나 목표가 빈 땅인 경우
-            ]
+            # 1. 방어 임무 할당 (기존 assign_defense_missions 사용하되, AI의 공격 비율 고려)
+            # 전체 군대의 (1 - attack_ratio_ai) 만큼을 방어에 우선 할당하도록 수정 필요
+            # assign_defense_missions 내부의 DEFENSE_ALLOCATION_RATIO를 동적으로 변경하거나,
+            # 여기서 방어군을 먼저 선별하고 나머지를 공격군으로 활용
+            
+            # 임시: 기존 방어 로직은 유지하되, 유휴 군대 선정 시 AI 결정 반영
+            country.assign_defense_missions() # 기존 방어 로직 호출
 
-            # --- 빈 땅 점령 (항상 실행, 작전 조건과 무관) ---
+            # 2. 유휴 군대 선정 (방어/주둔 임무 제외, AI의 공격 목표 고려)
+            idle_armies_for_offense = [
+                army for army in country.armies
+                if army.strength > 0 and army.mission_type not in ["defense", "garrison"] and not army.in_battle and
+                (not army.target_province or (army.target_province and army.target_province.owner is None))
+            ]
+            game_logger.debug(f"국가 '{country.name}': 공격 작전용 유휴 군대 {len(idle_armies_for_offense)}명")
+
+            # 3. 공격 목표 설정 (AI 결정 우선, 없으면 빈 땅 또는 가까운 적)
+            primary_attack_target_province = None
+            can_attack_ai_target = False
+            if country.attack_target_ai: # AI가 지정한 국가가 있다면
+                # 해당 국가가 현재 'enemies' 목록에 있는지 확인 (전쟁 중인지)
+                if country.attack_target_ai in country.enemies:
+                    can_attack_ai_target = True
+                    if country.attack_target_ai.owned_provinces:
+                        # 수도를 우선 공격 대상으로 고려
+                        if country.attack_target_ai.capital_province and country.attack_target_ai.capital_province in country.attack_target_ai.owned_provinces:
+                            primary_attack_target_province = country.attack_target_ai.capital_province
+                        else:
+                            # 수도가 없거나 점령 불가능하면, 다른 프로빈스 중 랜덤 선택 (또는 다른 가치 기반 선택)
+                            primary_attack_target_province = random.choice(country.attack_target_ai.owned_provinces)
+                        game_logger.info(f"국가 '{country.name}': AI 지정 공격 대상 국가 '{country.attack_target_ai.name}' (적대 관계 확인됨)의 프로빈스 '{primary_attack_target_province.id if primary_attack_target_province else '없음'}' 공격 시도.")
+                    else:
+                        game_logger.info(f"국가 '{country.name}': AI 지정 공격 대상 국가 '{country.attack_target_ai.name}'는 프로빈스가 없어 공격 불가.")
+                        primary_attack_target_province = None # 공격할 프로빈스가 없음
+                else:
+                    game_logger.info(f"국가 '{country.name}': AI 지정 공격 대상 국가 '{country.attack_target_ai.name}'와 전쟁 중이 아님. 공격 보류.")
+                    # 이 경우, AI에게 선전포고를 다시 요청하거나, 다른 행동을 하도록 유도할 수 있음
+                    # 현재는 단순히 공격하지 않는 것으로 처리
+            
+            # 빈 땅 점령 로직 (AI 공격 목표가 없거나, 공격할 수 없는 상황일 때 또는 남는 군대로)
             available_empty_lands_near_owned = {}
             for owned_p in country.owned_provinces:
                 if not owned_p.is_island and not country.is_province_connected_to_capital(owned_p):
@@ -1504,11 +1901,12 @@ while running:
                         }
 
             assigned_empty_provinces_this_turn = set()
-            remaining_idle_armies = list(idle_armies)
+            remaining_idle_armies = list(idle_armies_for_offense) # 수정된 부분: idle_armies -> idle_armies_for_offense
 
             # 빈 땅이 있고 유휴 군대가 있으면 항상 점령 시도
-            if available_empty_lands_near_owned and idle_armies:
-                sorted_idle_armies_for_empty_land = sorted(idle_armies, key=lambda a: a.strength, reverse=True)
+            # 여기서 idle_armies_for_offense를 사용해야 합니다.
+            if available_empty_lands_near_owned and idle_armies_for_offense: 
+                sorted_idle_armies_for_empty_land = sorted(idle_armies_for_offense, key=lambda a: a.strength, reverse=True)
                 
                 # 빈 땅 점령에 더 많은 군대 할당 (기존: min, 변경: 가능한 모든 군대)
                 # 빈 땅 수와 군대 수 중 더 많은 쪽에 맞춰서 할당
@@ -1518,6 +1916,7 @@ while running:
                 )
                 
                 armies_to_assign_empty_land = sorted_idle_armies_for_empty_land[:num_armies_for_empty_land]
+                # remaining_idle_armies는 여기서 업데이트됩니다.
                 remaining_idle_armies = sorted_idle_armies_for_empty_land[num_armies_for_empty_land:]
 
                 for army_e in armies_to_assign_empty_land:
@@ -1525,275 +1924,102 @@ while running:
                         continue
                         
                     best_empty_target = None
-                   
                     min_actual_distance = float('inf')
                     
+                    # 빈 땅 점령 시에도 AI가 지정한 공격 대상 국가가 있다면, 그쪽으로 향하는 경로 상의 빈 땅을 우선 고려할 수 있음
+                    # 여기서는 간단히 가장 가까운 빈 땅으로 설정
                     for p_id, land_info in available_empty_lands_near_owned.items():
-                        if land_info['province'] not in assigned_empty_provinces_this_turn:
+                        if land_info['province'] not in assigned_empty_provinces_this_turn: # 아직 이번 턴에 할당 안된 빈 땅
+                            # 현재 군대 위치에서 빈 땅까지의 실제 경로 길이 계산
+                            # 빈 땅은 'from_province'를 거쳐서 가야 하므로, army -> from_province -> target_empty_land
                             distance_to_launch_point = army_e.calculate_actual_path_length(
                                 army_e.current_province, land_info['from_province']
                             )
-                            total_distance = distance_to_launch_point + 1
+                            if distance_to_launch_point == float('inf'): # 도달 불가
+                                continue
+                                
+                            total_distance_to_empty = distance_to_launch_point + 1 # from_province에서 빈 땅까지는 1
                             
-                            if total_distance < min_actual_distance:
-                                min_actual_distance = total_distance
+                            if total_distance_to_empty < min_actual_distance:
+                                min_actual_distance = total_distance_to_empty
                                 best_empty_target = land_info['province']
                     
                     if best_empty_target:
                         army_e.set_target(best_empty_target)
+                        army_e.mission_type = "attack" # 빈 땅 점령도 공격 임무로 간주
                         assigned_empty_provinces_this_turn.add(best_empty_target)
-                        print(f"군대 {army_e.owner.color} -> 빈 땅 {best_empty_target.id}")
+                        game_logger.info(f"국가 '{country.name}' 군대 (ID: {id(army_e)}) -> 빈 땅 {best_empty_target.id} 점령 이동 (거리: {min_actual_distance})")
+            
+            # AI가 지정한 공격 대상이 있고, 공격이 가능한 상황이라면 해당 목표 공격
+            if primary_attack_target_province and can_attack_ai_target and remaining_idle_armies:
+                game_logger.info(f"국가 '{country.name}': AI 지정 목표 '{primary_attack_target_province.id}' (소유: {primary_attack_target_province.owner.name}) 공격 작전 시작. 가용 군대: {len(remaining_idle_armies)}")
+                # AI가 결정한 공격 비율에 따라 군대 할당
+                num_attackers_for_ai_target = math.ceil(len(remaining_idle_armies) * country.attack_ratio_ai)
+                attackers_ai = remaining_idle_armies[:num_attackers_for_ai_target]
+                # 나머지 군대는 다른 임무 (예: 빈 땅 점령 또는 추가 방어)에 사용될 수 있도록 남겨둠
+                remaining_idle_armies = remaining_idle_armies[num_attackers_for_ai_target:] 
+                
+                for attacker in attackers_ai:
+                    attacker.set_target(primary_attack_target_province)
+                    attacker.mission_type = "attack"
+                    game_logger.info(f"  ㄴ 군대 (ID: {id(attacker)}) -> AI 목표 프로빈스 {primary_attack_target_province.id} 공격 이동.")
+            
+            # AI 지정 공격 목표가 없거나, 공격할 수 없는 상황이거나, AI 공격 후 남은 유휴 군대가 있다면
+            # 이 군대로 다른 작전 (주로 빈 땅 점령 또는 현재 적대 관계인 다른 적 공격) 수행
+            if remaining_idle_armies:
+                game_logger.debug(f"국가 '{country.name}': AI 지정 공격 외 추가 작전 수행. 남은 유휴 군대 {len(remaining_idle_armies)}명.")
+                for army_ind in remaining_idle_armies:
+                    if not army_ind.current_province: continue
+                    
+                    candidate_targets = []
+                    current_army_coord = army_ind.current_province.get_center_coordinates()
 
-            # --- 주 작전 계획 (남은 군대로만) ---
-            # 주 작전 계획 조건을 더 엄격하게 변경
-            should_plan_operation = False
-            if len(remaining_idle_armies) >= MIN_ARMIES_FOR_OPERATION * 2:  # 기존보다 2배 많은 군대가 있을 때만
-                should_plan_operation = True
-            elif 1 <= len(remaining_idle_armies) < MIN_ARMIES_FOR_OPERATION * 2:
-                remaining_strength = sum(army.strength for army in remaining_idle_armies)
-                if remaining_strength >= MIN_STRENGTH_FOR_SINGLE_ARMY_OPERATION * 1.5:  # 더 강한 군대만
-                    should_plan_operation = True
+                    for p_candidate in provinces:
+                        if p_candidate.owner == country: # 아군 프로빈스 제외
+                            continue
 
-            if should_plan_operation and remaining_idle_armies:
-                # 기존 주 작전 로직은 remaining_idle_armies 사용
-                idle_armies = remaining_idle_armies
-                potential_enemy_targets = []
-                actual_attack_targets = []
-
-                if idle_armies: # 빈 땅 점령 후에도 유휴 군대가 남았다면
-                    print(f"  빈 땅 점령 후 남은 유휴 군대 {len(idle_armies)}명으로 주 작전 계속.")
-                    # 1. 공격 목표 선정 (여러 개 가능) - 여기서부터는 이전 로직과 유사하게 진행
-                    # potential_enemy_targets = [] # 이미 위에서 초기화됨
-                # for문은 if idle_armies 블록 바깥에 있어야 모든 경우에 potential_enemy_targets를 채울 수 있음.
-                # 하지만, idle_armies가 없으면 어차피 공격 그룹도 없으므로, 현재 위치도 논리적으로는 큰 문제 없음.
-                # 더 명확하게 하려면, 공격 목표를 찾는 로직은 idle_armies 유무와 관계없이 수행하고,
-                # 실제 군대 할당만 idle_armies 유무에 따라 결정하는 것이 좋음.
-                # 여기서는 일단 NameError만 해결하는 방향으로 최소 수정.
-                # if idle_armies: # 이 조건은 이미 위에 있음.
-                for p in provinces: # 이 for문은 공격 목표를 찾는 로직
-                    if p.owner and p.owner != country: # 적 프로빈스인 경우
-                        can_attack_directly = False # 직접 국경을 맞대고 공격 가능한지
-                        can_attack_island = False   # 해안에서 섬을 공격 가능한지
-
-                        for owned_p in country.owned_provinces:
-                            # 1. 직접 국경을 맞댄 경우 (기존 로직)
-                            if p in owned_p.border_provinces and \
-                               (not owned_p.is_island and country.is_province_connected_to_capital(owned_p) or owned_p.is_island):
-                                can_attack_directly = True
-                                break # 직접 공격 가능하면 더 볼 필요 없음
-                            
-                            # 2. 섬 공격 가능성 확인 (새로 추가된 로직)
-                            # 조건: 아군 프로빈스가 해안이고, 수도와 연결되어 있으며 (또는 자신이 섬이거나)
-                            #       적 프로빈스는 섬이어야 함.
-                            if owned_p.is_coastal and \
-                               (owned_p.is_island or country.is_province_connected_to_capital(owned_p)) and \
-                               p.is_island:
-                                # 해안 프로빈스와 섬 사이의 거리 계산 (간단히 중심점 간 거리)
-                                owned_p_center_x, owned_p_center_y = owned_p.get_center_coordinates()
-                                island_p_center_x, island_p_center_y = p.get_center_coordinates()
-                                
-                                distance_to_island = math.sqrt(
-                                    (owned_p_center_x - island_p_center_x)**2 + 
-                                    (owned_p_center_y - island_p_center_y)**2
-                                )
-                                
-                                # 예: 특정 거리 이내의 섬만 공격 대상으로 간주 (예: 50 유닛)
-                                MAX_ISLAND_ATTACK_RANGE = 50 
-                                if distance_to_island <= MAX_ISLAND_ATTACK_RANGE:
-                                    can_attack_island = True
-                                    # print(f"    섬 공격 가능: {owned_p.id} (해안) -> {p.id} (섬), 거리: {distance_to_island:.2f}")
-                                    break # 공격 가능한 섬을 찾았으면 더 볼 필요 없음
+                        # 목표 우선순위:
+                        # 1. 현재 적대 관계(enemies)인 국가의 수도
+                        # 2. 현재 적대 관계(enemies)인 국가의 일반 프로빈스
+                        # 3. 빈 땅
+                        # 중립 국가는 명시적인 선전포고 없이는 공격하지 않음 (AI가 선전포고 후 attack_target_ai로 지정해야 함)
                         
-                        if can_attack_directly or can_attack_island:
-                            if p not in potential_enemy_targets: # 중복 추가 방지
-                                potential_enemy_targets.append(p)
-                
-                actual_attack_targets = []
-                if potential_enemy_targets:
-                    # 가장 가까운 적들을 우선 목표로 삼음 (최대 2-3개)
-                    if idle_armies and idle_armies[0].current_province: # 첫 유휴 군대 위치 기준 (idle_armies 비어있는지 확인)
-                        start_coord = idle_armies[0].current_province.get_center_coordinates()
-                        potential_enemy_targets.sort(key=lambda p_target: math.sqrt(
-                            (p_target.get_center_coordinates()[0] - start_coord[0])**2 +
-                            (p_target.get_center_coordinates()[1] - start_coord[1])**2
-                        ))
-                    # else: # idle_armies가 비어있으면 정렬 없이 potential_enemy_targets 그대로 사용하거나, 다른 기준으로 정렬 가능
-                        # print(f"    적 목표 정렬 스킵 (유휴 군대 없음 또는 현재 프로빈스 정보 없음)")
-                    actual_attack_targets = list(potential_enemy_targets) # 모든 잠재적 적 목표를 실제 목표로 설정
-                    if actual_attack_targets: # 실제 목표가 선정된 경우에만 로그 출력
-                        print(f"  선정된 적 공격 목표: {[t.id for t in actual_attack_targets]} (섬 포함 가능)")
+                        priority = 10 # 기본값 (공격 대상 아님)
+                        target_owner = p_candidate.owner
 
-                    # 적 공격 목표가 없다면 빈 땅 점령 목표 선정
-                    if not actual_attack_targets: # 여기서 actual_attack_targets는 위에서 적 목표를 못 찾았을 경우 비어있을 수 있음
-                        # empty_provinces_targets = [] # 이 변수는 사용되지 않으므로 제거 가능
-                        empty_provinces_all_candidates = [p for p in provinces if p.owner is None] # 모든 빈 땅 후보
-
-                        # 이 계획 주기에서 이미 첫 번째 단계에서 목표로 지정된 빈 땅 제외
-                        empty_provinces_available_for_main_op = [
-                            p for p in empty_provinces_all_candidates
-                            if p not in assigned_empty_provinces_this_turn
-                        ]
-
-                        if empty_provinces_available_for_main_op:
-                            if idle_armies and idle_armies[0].current_province: # 여기서 idle_armies는 remaining_idle_armies 입니다.
-                                start_coord = idle_armies[0].current_province.get_center_coordinates()
-                                empty_provinces_available_for_main_op.sort(key=lambda p_target: math.sqrt(
-                                    (p_target.get_center_coordinates()[0] - start_coord[0])**2 +
-                                    (p_target.get_center_coordinates()[1] - start_coord[1])**2
-                                ))
-                            # else:
-                                # print(f"    빈 땅 목표 정렬 스킵 (유휴 군대 없음 또는 현재 프로빈스 정보 없음)")
-                            
-                            # 실제 공격 목표로 설정 (최대 3개)
-                            actual_attack_targets = empty_provinces_available_for_main_op[:min(len(empty_provinces_available_for_main_op), 3)]
-                            if actual_attack_targets: # 실제 목표가 선정된 경우에만 로그 출력
-                                print(f"  선정된 빈 땅 점령 목표 (주 작전): {[t.id for t in actual_attack_targets]}")
-                
-                if actual_attack_targets: # 공격/점령할 목표가 하나라도 있다면
-                    # 2. 군대 그룹 분배 - 빈 땅이 우선이면 공격에 더 집중
-                    idle_armies.sort(key=lambda army: army.strength, reverse=True) 
+                        if target_owner is None: # 빈 땅
+                            priority = 3
+                        elif target_owner in country.enemies: # 적대 국가
+                            if target_owner.capital_province == p_candidate:
+                                priority = 1 # 적 수도
+                            else:
+                                priority = 2 # 적 일반 프로빈스
+                        # else: 중립 국가는 여기서는 공격 대상으로 고려 안 함
+                        
+                        if priority <= 3: # 공격 가능한 대상 (적 또는 빈 땅)
+                            dist = math.sqrt(
+                                (p_candidate.get_center_coordinates()[0] - current_army_coord[0])**2 +
+                                (p_candidate.get_center_coordinates()[1] - current_army_coord[1])**2
+                            )
+                            candidate_targets.append({'province': p_candidate, 'distance': dist, 'priority': priority})
                     
-                    # 빈 땅 목표가 많으면 방어군을 줄이고 공격군을 늘림
-                    empty_land_targets = [t for t in actual_attack_targets if t.owner is None]
-                    enemy_targets = [t for t in actual_attack_targets if t.owner is not None]
-                    
-                    attack_group = []
-                    defense_group = []
-
-                    if len(idle_armies) == 1:
-                        attack_group = list(idle_armies)
-                        defense_group = []
-                        print(f"  단일 강력 군대 작전: 공격군 {len(attack_group)}명")
-                    elif len(empty_land_targets) > len(enemy_targets):
-                        # 빈 땅이 더 많으면 70% 공격, 30% 방어 (기존 80%/20%에서 조정)
-                        num_attack_armies = max(1, math.ceil(len(idle_armies) * 0.7))
-                        attack_group = idle_armies[:num_attack_armies]
-                        defense_group = idle_armies[num_attack_armies:]
-                        print(f"  빈 땅 우선 작전: 공격군 {len(attack_group)}명, 방어군 {len(defense_group)}명")
+                    if candidate_targets:
+                        candidate_targets.sort(key=lambda x: (x['priority'], x['distance'])) # 우선순위, 그 다음 거리
+                        chosen_target_province = candidate_targets[0]['province']
+                        army_ind.set_target(chosen_target_province)
+                        army_ind.mission_type = "attack"
+                        target_status = "빈 땅"
+                        if chosen_target_province.owner:
+                            target_status = f"적국({chosen_target_province.owner.name}) 프로빈스"
+                            if chosen_target_province.owner.capital_province == chosen_target_province:
+                                target_status = f"적국({chosen_target_province.owner.name}) 수도"
+                        game_logger.info(f"  ㄴ 군대 (ID: {id(army_ind)}) -> 일반 목표 {chosen_target_province.id} ({target_status}) 공격 이동.")
                     else:
-                        # 적군이 더 많으면 50% 공격, 50% 방어 (기존 60%/40%에서 조정)
-                        num_attack_armies = math.ceil(len(idle_armies) * 0.5)
-                        attack_group = idle_armies[:num_attack_armies]
-                        defense_group = idle_armies[num_attack_armies:]
-                        print(f"  적군 우선 작전: 공격군 {len(attack_group)}명, 방어군 {len(defense_group)}명")
+                        game_logger.debug(f"  ㄴ 군대 (ID: {id(army_ind)}): 공격할 적절한 일반 목표 없음. 대기.")
 
 
-                    # 3. 공격 그룹 목표 할당
-                    if attack_group and actual_attack_targets:
-                        for i, army_atk in enumerate(attack_group):
-                            target_for_atk_army = actual_attack_targets[i % len(actual_attack_targets)]
-                            army_atk.mission_type = "attack" # 공격 임무 설정
-                            army_atk.defense_province_target = None # 공격 임무 시 방어 목표는 없음
-                            army_atk.set_target(target_for_atk_army)
-                            # print(f"    공격군 {id(army_atk)} ({army_atk.strength}) -> 목표 {target_for_atk_army.id} ({'적' if target_for_atk_army.owner and target_for_atk_army.owner != country else '빈땅'})")
-                    
-                    # 4. 방어 그룹 목표 할당
-                    if defense_group and actual_attack_targets:
-                        # 방어 그룹은 주로 첫 번째 공격 목표(primary_defense_reference_target)를 기준으로 방어 위치를 선정
-                        primary_defense_reference_target = actual_attack_targets[0]
-
-                        # 방어 위치 선정: 공격 목표의 인접 프로빈스가 아닌, 해당 인접 프로빈스들의 '뒤쪽' 아군 프로빈스를 찾음
-                        # 즉, 적과 직접 맞닿는 최전선보다는 한 칸 뒤의 안전한 지원 위치를 찾음.
-                        potential_staging_areas = set()
-                        # 1. primary_defense_reference_target(적 목표)에 인접한 아군 프로빈스 찾기 (최전선)
-                        frontline_friendly_provinces = [
-                            fp for fp in country.owned_provinces 
-                            if primary_defense_reference_target in fp.border_provinces and \
-                               (fp.is_island or country.is_province_connected_to_capital(fp))
-                        ]
-
-                        # 2. 최전선 아군 프로빈스들의 뒤에 있는(인접한 다른 아군 프로빈스) 곳을 주둔지로 고려
-                        for front_p in frontline_friendly_provinces:
-                            for rear_p in front_p.border_provinces:
-                                if rear_p.owner == country and rear_p != front_p and \
-                                   (rear_p.is_island or country.is_province_connected_to_capital(rear_p)):
-                                    potential_staging_areas.add(rear_p)
-                        
-                        # 만약 적절한 후방 주둔지가 없다면, 최전선 아군 프로빈스를 주둔지로 사용
-                        if not potential_staging_areas and frontline_friendly_provinces:
-                            potential_staging_areas.update(frontline_friendly_provinces)
-                        
-                        friendly_staging_provinces = list(potential_staging_areas)
-
-                        if friendly_staging_provinces:
-                            # print(f"  방어 그룹 배치 시작. 기준 적 목표: {primary_defense_reference_target.id}, 주둔 가능 아군 프로빈스: {[p.id for p in friendly_staging_provinces]}")
-                            
-                            temp_defense_assignments = {p.id: [] for p in friendly_staging_provinces}
-                            armies_for_defense_staging = list(defense_group)
-
-                            # 각 주둔지에 최소 1개씩 또는 가능한 만큼 분산 배치
-                            idx_staging = 0
-                            while armies_for_defense_staging and idx_staging < len(friendly_staging_provinces):
-                                army_to_stage = armies_for_defense_staging.pop(0)
-                                temp_defense_assignments[friendly_staging_provinces[idx_staging].id].append(army_to_stage)
-                                idx_staging = (idx_staging + 1) % len(friendly_staging_provinces) # 순환하며 배분
-                            
-                            # 남은 군대가 있다면, 가장 병력이 적게 할당된 주둔지부터 추가 배치 (균등 분배 시도)
-                            if armies_for_defense_staging:
-                                friendly_staging_provinces.sort(key=lambda p_sort: sum(a.strength for a in temp_defense_assignments[p_sort.id]))
-                                for i, army_rem_def in enumerate(armies_for_defense_staging):
-                                    target_staging_province = friendly_staging_provinces[i % len(friendly_staging_provinces)]
-                                    temp_defense_assignments[target_staging_province.id].append(army_rem_def)
-                                # print(f"    남은 방어군 {len(armies_for_defense_staging)}명 추가 분산 배치 완료.")
-
-                            # 최종 할당: 각 군대에 방어 임무 부여
-                            for p_id, armies_list in temp_defense_assignments.items():
-                                staging_province_obj = next((p_obj for p_obj in friendly_staging_provinces if p_obj.id == p_id), None)
-                                if staging_province_obj and armies_list:
-                                    for army_final_def in armies_list:
-                                        # 방어 대상은 primary_defense_reference_target (적 프로빈스) 또는
-                                        # staging_province_obj에 가장 가까운 primary_defense_reference_target에 인접한 아군 프로빈스
-                                        # 여기서는 primary_defense_reference_target을 주시하도록 설정
-                                        army_final_def.set_defense_mission(primary_defense_reference_target, staging_province_obj)
-                        else:
-                            # print(f"  방어 그룹: 주둔할 적절한 아군 프로빈스 없음. 가장 가까운 아군 프로빈스로 후퇴/대기.")
-                            for army_def_fallback in defense_group:
-                                army_def_fallback.mission_type = "garrison" # 주둔 임무로 변경
-                                army_def_fallback.defense_province_target = None
-                                if country.owned_provinces:
-                                    # 현재 위치 또는 가장 가까운 안전한 아군 프로빈스로 이동
-                                    if army_def_fallback.current_province.owner == country and \
-                                       (army_def_fallback.current_province.is_island or country.is_province_connected_to_capital(army_def_fallback.current_province)):
-                                        army_def_fallback.set_target(army_def_fallback.current_province) # 현재 위치 고수
-                                    else:
-                                        # 가장 가까운 안전한 아군 프로빈스 찾기
-                                        safest_fallback = None
-                                        min_dist = float('inf')
-                                        current_army_coord = army_def_fallback.current_province.get_center_coordinates()
-                                        for p_owned in country.owned_provinces:
-                                            if p_owned.is_island or country.is_province_connected_to_capital(p_owned):
-                                                dist = math.sqrt(
-                                                    (p_owned.get_center_coordinates()[0] - current_army_coord[0])**2 +
-                                                    (p_owned.get_center_coordinates()[1] - current_army_coord[1])**2)
-                                                if dist < min_dist:
-                                                    min_dist = dist
-                                                    safest_fallback = p_owned
-                                        if safest_fallback:
-                                            army_def_fallback.set_target(safest_fallback)
-                                            # print(f"    방어군 {id(army_def_fallback)} -> 안전 후방 {safest_fallback.id}로 주둔 이동")
-                                        else: # 이동할 곳이 없으면 현재 위치에서 대기 (이론상 여기까지 오면 안됨)
-                                            army_def_fallback.set_target(army_def_fallback.current_province)
-
-                else: # should_plan_operation이 False인 경우 또는 작전 목표가 없을 때
-                    # print(f"{country.color} 국가: 대규모 작전 조건 미달 또는 목표 없음. 유휴 군대(공격/방어 임무 아닌) 개별 행동.")
-                    # 여기서 idle_armies는 이미 방어/주둔 임무 군대가 필터링된 상태
-                    for army_ind in idle_armies: 
-                        if not army_ind.current_province: continue
-                        army_ind.mission_type = "attack" # 기본적으로 공격 시도
-                        army_ind.defense_province_target = None
-                        # 간단히 가장 가까운 빈 땅 또는 적 땅
-                        available_targets_overall = []
-                        current_army_coord = army_ind.current_province.get_center_coordinates()
-                        for p_candidate in provinces:
-                            if p_candidate != army_ind.current_province and (p_candidate.owner is None or (p_candidate.owner and p_candidate.owner != country)):
-                                dist = math.sqrt((p_candidate.get_center_coordinates()[0] - current_army_coord[0])**2 + (p_candidate.get_center_coordinates()[1] - current_army_coord[1])**2)
-                                available_targets_overall.append({'province': p_candidate, 'distance': dist, 'is_island': p_candidate.is_island})
-                        if available_targets_overall:
-                            available_targets_overall.sort(key=lambda x: (x['is_island'], x['distance']))
-                            army_ind.set_target(available_targets_overall[0]['province'])
-                            print(f"  개별 군대 {id(army_ind)} -> 가장 가까운 미점령지 {available_targets_overall[0]['province'].id}")    
-            # --- 후방 방어군 재배치 로직 추가 ---
-            # "모든 방어군 중, 적과 접경하지 않은 프로빈스에 있는 군대의 70%를 가장 가까운 빈 땅으로 보내줘."
+            # --- 후방 방어군 재배치 로직 (기존 로직 유지 또는 AI 결정과 통합) ---
+            # 현재는 기존 로직 유지
             non_frontier_defense_armies = []
             for army_to_check in country.armies:
                 if army_to_check.strength > 0 and army_to_check.mission_type in ["defense", "garrison"] and army_to_check.current_province:
@@ -1930,14 +2156,24 @@ while running:
     # --- 국가 정보 표시 ---
     text_y_offset = 10
     for i, country in enumerate(countries):
-        country_info = f"국가 {i+1} ({country.color}): 인구 {country.get_total_population():,} | GDP {country.get_total_gdp():,} | 프로빈스 {len(country.owned_provinces)} | 군대 {len(country.armies)}"
-        text_surface = font.render(country_info, True, black) # 검은색 텍스트
+        # 외교 관계 표시 추가
+        allies_str = ", ".join([ally.name for ally in country.allies]) if country.allies else "없음"
+        enemies_str = ", ".join([enemy.name for enemy in country.enemies]) if country.enemies else "없음"
+        
+        country_info = f"{country.name} ({country.color}): 인구 {country.get_total_population():,} | GDP {country.get_total_gdp():,}"
+        country_info2 = f"  프로빈스 {len(country.owned_provinces)} | 군대 {len(country.armies)} | 동맹: {allies_str} | 적대: {enemies_str}"
+        
+        text_surface = font.render(country_info, True, black)
         screen.blit(text_surface, (10, text_y_offset))
-        text_y_offset += 20 # 다음 줄로 이동
+        text_y_offset += 20
+        text_surface2 = font.render(country_info2, True, black)
+        screen.blit(text_surface2, (10, text_y_offset))
+        text_y_offset += 25 # 국가별 간격
 
     # 화면 업데이트 (그려진 내용을 화면에 표시)
     pygame.display.update()
 
 # Pygame 종료 및 시스템 종료
+game_logger.info("게임 종료.")
 pygame.quit()
 sys.exit()

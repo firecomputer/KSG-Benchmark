@@ -1,7 +1,10 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
 import re
 import logging
+import json # JSON 파싱을 위해 추가
+import asyncio # 비동기 처리를 위해 추가
 
 # --- 로깅 설정 ---
 # gemini.log 파일에 로그를 기록하도록 설정합니다.
@@ -21,9 +24,9 @@ if not logger.handlers: # 핸들러가 이미 설정되어 있지 않은 경우�
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     # 콘솔 핸들러도 추가 (디버깅 시 유용)
-    # console_handler = logging.StreamHandler()
-    # console_handler.setFormatter(formatter)
-    # logger.addHandler(console_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 class GeminiAgent:
     def __init__(self, model_name="gemini-2.5-flash-preview-05-20"): # 모델명 변경 가능
@@ -32,16 +35,32 @@ class GeminiAgent:
         :param model_name: 사용할 Gemini 모델 이름
         """
         self.model_name = model_name
-        self.model = genai.GenerativeModel(self.model_name)
-        self.chat = None # 채팅 세션은 필요에 따라 시작
+        self.client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY")) # 기본 클라이언트 생성성
+        # API 키 설정은 genai.configure()를 사용하거나, Client 생성 시 직접 전달할 수 있습니다.
+        # genai.configure(api_key=os.getenv("GOOGLE_API_KEY")) # 보통 애플리케이션 시작 시 한 번 호출
         self.logger = logging.getLogger('GeminiAgentLogger') # 클래스 인스턴스별 로거 사용
         self.logger.info(f"GeminiAgent 초기화 완료 (모델: {self.model_name})")
 
-
-    def _start_chat_session(self):
-        """채팅 세션을 시작합니다."""
-        if not self.chat:
-            self.chat = self.model.start_chat(history=[])
+    async def _send_message_async(self, full_prompt: str) -> str | None:
+        """
+        Gemini 모델에 프롬프트를 비동기적으로 보내고 응답을 받습니다.
+        :param full_prompt: 전체 프롬프트 문자열
+        :return: 모델의 응답 텍스트 또는 실패 시 None
+        """
+        self.logger.info(f"Gemini API 비동기 요청 시작. 프롬프트 길이: {len(full_prompt)}")
+        try:
+            # 여기서는 단순 문자열 프롬프트를 사용합니다.
+            # config 인자도 추가하여 _send_message와 일관성 유지
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_name,
+                contents=[full_prompt]
+            )
+            self.logger.info(f"Gemini API 비동기 응답 수신 (일부): {response.text[:200] if response.text else '응답 없음'}")
+            return response.text
+        except Exception as e:
+            self.logger.error(f"Gemini API 비동기 호출 중 오류 발생: {e}", exc_info=True)
+            return None
 
     def _get_game_state_prompt_text(self, game_state):
         """현재 게임 상태를 LLM 프롬프트에 포함할 텍스트로 변환합니다."""
@@ -99,14 +118,18 @@ class GeminiAgent:
         :param current_game_state: 현재 게임 상태 정보
         :return: 모델의 응답 텍스트
         """
-        self._start_chat_session()
         game_state_text = self._get_game_state_prompt_text(current_game_state)
         full_prompt = f"{game_state_text}\n{base_prompt}"
         
         self.logger.info(f"Gemini API 요청 시작. 전체 프롬프트:\n{full_prompt}")
         
         try:
-            response = self.chat.send_message(full_prompt)
+            # generate_content 호출 시 config 대신 generation_config 사용 (Gemini API 표준)
+            # self.generate_content_config가 정의되어 있지 않을 수 있으므로 getattr 사용
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_prompt
+            )
             self.logger.info(f"Gemini API 응답 수신:\n{response.text}")
             return response.text
         except Exception as e:
@@ -249,6 +272,137 @@ class GeminiAgent:
         # 파싱 실패 시 이미 _parse_decision_reason에서 로그를 남겼으므로 여기서는 추가 로그 없이 반환
         return False, response_text
 
+    async def get_comprehensive_decision_async(self, current_game_state: dict, budget_to_allocate: float, war_options: list, alliance_options: list, truce_options: list) -> dict:
+        """
+        한 번의 API 호출로 모든 주요 AI 결정을 비동기적으로 가져옵니다.
+        JSON 형식으로 응답을 요청하고 파싱합니다.
+        """
+        game_state_text = self._get_game_state_prompt_text(current_game_state)
+        
+        # 사용 가능한 옵션들을 문자열로 변환
+        war_options_str = ", ".join(war_options) if war_options else "없음"
+        alliance_options_str = ", ".join(alliance_options) if alliance_options else "없음"
+        truce_options_str = ", ".join(truce_options) if truce_options else "없음"
+
+        # JSON 응답을 위한 프롬프트 구성
+        # 모델이 JSON을 더 잘 생성하도록 예시를 명확히 하고, 필요한 모든 키를 나열합니다.
+        prompt = f"""{game_state_text}
+당신은 전략 시뮬레이션 게임의 AI 플레이어입니다. 현재 상황을 분석하여 다음 모든 결정 사항에 대해 최적의 판단을 내려주세요.
+반드시 다음 JSON 형식에 맞춰 모든 키와 함께 응답해야 합니다. 각 결정에 대한 이유도 포함해주세요.
+만약 특정 행동을 하지 않기로 결정했다면, 해당 target_nation 필드에 "없음" 또는 "아니오"를 사용하세요.
+
+요청 형식:
+{{
+  "budget": {{
+    "defense_ratio": "[0.0-1.0 사이 국방 예산 비율]",
+    "economy_ratio": "[0.0-1.0 사이 경제 예산 비율]",
+    "research_ratio": "[0.0-1.0 사이 연구 예산 비율]",
+    "reason": "[예산 편성 이유]"
+  }},
+  "attack_strategy": {{
+    "target_nation": "[공격 대상 국가명 또는 '없음']",
+    "attack_ratio": "[0.0-1.0 사이 공격 병력 비율]",
+    "reason": "[공격/방어 전략 이유]"
+  }},
+  "declare_war": {{
+    "target_nation": "[선전포고 대상 국가명 또는 '아니오']",
+    "reason": "[선전포고 결정 이유]"
+  }},
+  "form_alliance": {{
+    "target_nation": "[동맹 제안 대상 국가명 또는 '아니오']",
+    "reason": "[동맹 결정 이유]"
+  }},
+  "offer_truce": {{
+    "target_nation": "[휴전 제안 대상 국가명 또는 '아니오']",
+    "reason": "[휴전 결정 이유]"
+  }}
+}}
+
+현재 상황을 고려할 때, 다음 사항들을 반드시 기억하세요:
+- 너무 평화를 지향하려 하지 마십시오. 비슷하거나 약한 체급의 경쟁자가 있으면 최종 승리를 하기 위해 전쟁을 해야 합니다.
+- 너무 공격적이지도 마십시오. 너무 강한 경쟁자와의 전쟁은 자원 낭비가 될 수 있습니다.
+- 현재 상황에서는 세력 균형을 고려하여 전략적으로 행동해야 합니다.
+- 동맹국이 있다면 그들과의 관계를 고려하여 공동 전선을 형성할 수 있는지 판단하세요.
+- 경제력(GDP)과 군사력(army_count), 인구를 종합적으로 고려하여 상대의 강약을 판단하세요.
+- 접경국가와의 관계는 특히 중요합니다. 국경을 맞대고 있는 국가와의 전쟁이나 동맹은 즉각적인 영향을 미칩니다.
+- 현재 발생 중인 전역 사건들(global_events)이 당신의 결정에 어떤 영향을 미칠지 고려하세요.
+- 예산 편성 시에는 현재 전쟁 상황, 경제 상태, 기술 격차를 모두 고려해야 합니다.
+- 공격 전략에서는 상대방의 방어력과 지리적 위치를 고려하여 현실적인 성공 가능성을 판단하세요.
+- 휴전은 현재 전황이 불리하거나 장기전으로 인한 소모전이 예상될 때 고려해야 합니다.
+- 동맹 제안은 상호 이익이 되고, 장기적으로 안정적인 관계를 유지할 수 있는 국가를 우선시하세요.
+- 모든 결정은 최종 승리라는 목표를 달성하기 위한 단계적 전략의 일부여야 합니다.
+
+
+현재 고려할 수 있는 옵션:
+- 선전포고 가능 대상: {war_options_str}
+- 동맹 가능 대상: {alliance_options_str}
+- 휴전 가능 대상 (현재 전쟁 중인 국가): {truce_options_str}
+- 편성할 총 예산의 기준점 (실제 총 예산의 일부): {budget_to_allocate} (이 값을 기준으로 국방, 경제, 연구 비율을 정해주세요. 비율의 합은 1.0이어야 합니다.)
+
+위 정보를 바탕으로 최적의 종합적인 결정을 JSON 형식으로 내려주세요.
+"""
+        response_text = await self._send_message_async(prompt)
+        
+        default_decisions = {
+            "budget": {"defense_ratio": 0.4, "economy_ratio": 0.3, "research_ratio": 0.3, "reason": "기본 예산 편성"},
+            "attack_strategy": {"target_nation": "없음", "attack_ratio": 0.5, "reason": "기본 전략"},
+            "declare_war": {"target_nation": "아니오", "reason": "기본 결정"},
+            "form_alliance": {"target_nation": "아니오", "reason": "기본 결정"},
+            "offer_truce": {"target_nation": "아니오", "reason": "기본 결정"}
+        }
+
+        if not response_text:
+            self.logger.error("종합 결정 API 응답 없음. 기본값 사용.")
+            return default_decisions
+
+        try:
+            # 모델 응답에서 JSON 부분만 추출 시도 (마크다운 코드 블록 처리)
+            json_match = re.search(r"```json\s*([\s\S]+?)\s*```", response_text)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # 코드 블록이 없다면 전체 텍스트를 JSON으로 가정
+                json_str = response_text
+            
+            decisions = json.loads(json_str)
+            self.logger.info(f"종합 결정 파싱 성공: {decisions}")
+            
+            # 필수 키 존재 여부 및 기본값 채우기 (더 견고하게)
+            for key, default_value_map in default_decisions.items():
+                if key not in decisions or not isinstance(decisions[key], dict):
+                    decisions[key] = default_value_map
+                    self.logger.warning(f"종합 결정에서 '{key}' 누락 또는 타입 오류. 기본값 사용.")
+                else:
+                    for sub_key, default_sub_value in default_value_map.items():
+                        if sub_key not in decisions[key]:
+                            decisions[key][sub_key] = default_sub_value
+                            self.logger.warning(f"종합 결정 '{key}'에서 '{sub_key}' 누락. 기본값 '{default_sub_value}' 사용.")
+            
+            # 예산 비율 합계 검증
+            budget = decisions.get("budget", {})
+            b_def = budget.get("defense_ratio", 0)
+            b_eco = budget.get("economy_ratio", 0)
+            b_res = budget.get("research_ratio", 0)
+            if not (isinstance(b_def, (int, float)) and isinstance(b_eco, (int, float)) and isinstance(b_res, (int, float)) and abs(b_def + b_eco + b_res - 1.0) < 0.01):
+                self.logger.error(f"종합 결정: 예산 비율 합계 또는 타입 오류 ({b_def}, {b_eco}, {b_res}). 기본 예산으로 재설정.")
+                decisions["budget"] = default_decisions["budget"]
+
+            # 공격 비율 검증
+            attack_strat = decisions.get("attack_strategy", {})
+            atk_ratio = attack_strat.get("attack_ratio", 0.5)
+            if not (isinstance(atk_ratio, (int, float)) and 0.0 <= atk_ratio <= 1.0):
+                self.logger.error(f"종합 결정: 공격 비율 범위 또는 타입 오류 ({atk_ratio}). 기본값 0.5로 재설정.")
+                decisions["attack_strategy"]["attack_ratio"] = 0.5
+
+
+            return decisions
+        except json.JSONDecodeError as e:
+            self.logger.error(f"종합 결정 JSON 파싱 실패: {e}. 응답: {response_text}", exc_info=True)
+            return default_decisions
+        except Exception as e:
+            self.logger.error(f"종합 결정 처리 중 알 수 없는 오류: {e}. 응답: {response_text}", exc_info=True)
+            return default_decisions
+
     def allocate_budget(self, current_budget, current_game_state):
         """
         예산을 편성합니다. (예: 국방, 경제, 연구 등)
@@ -350,43 +504,15 @@ class GeminiAgent:
         return None, 0.5, response_text # 기본값
 
 if __name__ == '__main__':
-    # __main__ 실행 시 로깅 기본 설정 (콘솔 출력 및 파일 로깅)
-    # GeminiAgent 클래스 내의 로거와는 별개로, 이 스크립트 자체 실행 시의 로그를 위함.
-    # 만약 game.py에서 이 파일을 import하여 사용한다면, game.py의 로깅 설정을 따르게 됨.
-    # 여기서는 이 파일 단독 실행 테스트를 위한 로깅 설정.
-    
-    # 루트 로거 설정 (모든 로거에 영향)
-    # logging.basicConfig(level=logging.INFO,
-    #                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    #                     handlers=[
-    #                         logging.FileHandler("gemini_agent_test.log", encoding='utf-8'), # 테스트용 로그 파일
-    #                         logging.StreamHandler()
-    #                     ])
-    # logger = logging.getLogger(__name__) # 현재 모듈용 로거
+    # GeminiAgent 인스턴스 생성
+    agent = GeminiAgent()
+    # agent.generate_content_config = types.GenerationConfig(temperature=0.7, top_p=0.9, top_k=40) # 필요시 설정
 
-    # API 키 설정
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        logger.critical("GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다! 테스트를 진행할 수 없습니다.")
-        # print("GOOGLE_API_KEY 환경 변수를 설정해주세요. 또는 코드 내에서 genai.configure(api_key=...)를 호출해주세요.")
-        exit()
-    else:
-        try:
-            genai.configure(api_key=api_key)
-            logger.info("GOOGLE_API_KEY가 성공적으로 설정되었습니다.")
-        except Exception as e:
-            logger.critical(f"GOOGLE_API_KEY 설정 중 오류 발생: {e}", exc_info=True)
-            exit()
-            
-    agent = GeminiAgent() # 에이전트 초기화 시 INFO 로그 기록됨
-
-    # 예시 게임 상태 (game.py 구조를 일부 반영)
-    # 실제 게임에서는 GameState 객체에서 이 정보를 추출해야 합니다.
-    # game_state_example 구조는 gemini_agent.py의 _get_game_state_prompt_text 와 game.py의 get_game_state_for_ai를 참고하여 일치시킵니다.
+    # get_comprehensive_decision_async 호출을 위한 예시 데이터
     game_state_example = {
         "current_turn": 10,
-        "my_nation_name": "고양이 왕국", 
-        "all_nations_details": [ # 첫 번째 요소가 '나의 국가' 정보여야 함
+        "my_nation_name": "고양이 왕국",
+        "all_nations_details": [
             {
                 "name": "고양이 왕국", "population": 150000, "gdp": 2000000,
                 "province_count": 5, "army_count": 3, "capital_province_id": 1,
@@ -408,69 +534,55 @@ if __name__ == '__main__':
                 "allies": [], "enemies": [], "relation_to_me": "중립"
             }
         ],
-        "my_nation_bordering_nations_detail": [ # 나의 접경 국가 상세 정보
-            {
-                "name": "쥐 제국", "population": 200000, "gdp": 1800000,
-                "relation_to_me": "적대" # 이 정보는 all_nations_details에서 가져오거나, 별도 계산
-            },
-            {
-                "name": "너구리 연합", "population": 90000, "gdp": 1500000,
-                "relation_to_me": "중립"
-            }
+        "my_nation_bordering_nations_detail": [
+            {"name": "쥐 제국", "relation_to_me": "적대"},
+            {"name": "너구리 연합", "relation_to_me": "중립"}
         ],
         "global_events": ["대규모 기근 발생", "기술 혁신 전파"]
     }
+    budget_to_allocate_example = 200000.0  # 예시 예산 (GDP의 10% 정도)
     
-    my_nation_info_for_prompt = next(n for n in game_state_example["all_nations_details"] if n["name"] == game_state_example["my_nation_name"])
-    
-    logger.info("--- 선전 포고 결정 테스트 ---")
-    potential_war_targets = [
+    my_nation_info = next((n for n in game_state_example["all_nations_details"] if n["name"] == game_state_example["my_nation_name"]), {})
+
+    war_options_example = [
         n["name"] for n in game_state_example["all_nations_details"]
         if n["name"] != game_state_example["my_nation_name"] and \
-           n["name"] not in my_nation_info_for_prompt.get("enemies", []) and \
-           n["name"] not in my_nation_info_for_prompt.get("allies", [])
+           n["name"] not in my_nation_info.get("allies", []) and \
+           n["name"] not in my_nation_info.get("enemies", [])
     ]
-    if not potential_war_targets: potential_war_targets = ["너구리 연합"]
+    if not war_options_example: war_options_example = ["임의의 적국1"] # 예시: 대상 없을 경우
 
-    decision_war, reason_war = agent.declare_war(potential_war_targets, game_state_example)
-    logger.info(f"선전 포고 결정: {decision_war}, 이유: {reason_war}\n")
-
-    logger.info("--- 동맹 결정 테스트 ---")
-    potential_alliance_targets = [
+    alliance_options_example = [
         n["name"] for n in game_state_example["all_nations_details"]
         if n["name"] != game_state_example["my_nation_name"] and \
-           n["name"] not in my_nation_info_for_prompt.get("allies", []) and \
-           n["name"] not in my_nation_info_for_prompt.get("enemies", [])
+           n["name"] not in my_nation_info.get("allies", [])
     ]
-    if not potential_alliance_targets: potential_alliance_targets = ["너구리 연합"]
+    if not alliance_options_example: alliance_options_example = ["임의의 중립국1"]
 
-    decision_alliance, reason_alliance = agent.form_alliance(potential_alliance_targets, game_state_example)
-    logger.info(f"동맹 결정: {decision_alliance}, 이유: {reason_alliance}\n")
+    truce_options_example = list(my_nation_info.get("enemies", []))
+    if not truce_options_example: truce_options_example = [] # 전쟁 중인 국가가 없을 수도 있음
 
-    logger.info("--- 휴전 결정 테스트 ---")
-    truce_targets = list(my_nation_info_for_prompt.get("enemies", []))
-    if not truce_targets: truce_targets = ["쥐 제국"] 
+    # 비동기 함수를 실행하기 위한 main 코루틴 정의
+    async def main():
+        logger.info("--- 종합 결정 테스트 (비동기) 시작 ---")
+        decisions = await agent.get_comprehensive_decision_async(
+            current_game_state=game_state_example,
+            budget_to_allocate=budget_to_allocate_example,
+            war_options=war_options_example,
+            alliance_options=alliance_options_example,
+            truce_options=truce_options_example
+        )
+        logger.info(f"종합 결정 (비동기) 결과:\n{json.dumps(decisions, indent=2, ensure_ascii=False)}")
+        print("--- 종합 결정 (비동기) 결과 ---")
+        print(json.dumps(decisions, indent=2, ensure_ascii=False))
+        logger.info("--- 종합 결정 테스트 (비동기) 완료 ---")
 
-    decision_truce, reason_truce = agent.offer_truce(truce_targets, game_state_example)
-    logger.info(f"휴전 결정: {decision_truce}, 이유: {reason_truce}\n")
+    # asyncio.run()을 사용하여 main 코루틴 실행
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("사용자에 의해 테스트 중단됨.")
+    except Exception as e:
+        logger.error(f"__main__ 실행 중 오류 발생: {e}", exc_info=True)
 
-    logger.info("--- 예산 편성 테스트 ---")
-    current_budget_example = my_nation_info_for_prompt["gdp"] * 0.1
-    budget_plan, reason_budget = agent.allocate_budget(current_budget_example, game_state_example)
-    logger.info(f"예산 계획: {budget_plan}, 이유: {reason_budget}\n")
-
-    logger.info("--- 공격-방어 비율 설정 테스트 ---")
-    attack_consider_targets = list(my_nation_info_for_prompt.get("enemies", []))
-    neutral_nations_for_attack = [
-        n["name"] for n in game_state_example["all_nations_details"]
-        if n["name"] != game_state_example["my_nation_name"] and \
-           n["name"] not in my_nation_info_for_prompt.get("allies", []) and \
-           n["name"] not in my_nation_info_for_prompt.get("enemies", [])
-    ]
-    attack_consider_targets.extend(neutral_nations_for_attack)
-    if not attack_consider_targets : attack_consider_targets = ["쥐 제국", "너구리 연합"]
-
-    attack_target_decision, attack_ratio, reason_ratio = agent.set_attack_defense_ratio(attack_consider_targets, game_state_example)
-    logger.info(f"공격 대상: {attack_target_decision}, 공격 비율: {attack_ratio}, 이유: {reason_ratio}\n")
-
-    logger.info("냐옹! Gemini 에이전트 테스트 완료! 로그는 gemini.log 또는 gemini_agent_test.log 에서 확인하세요!")
+    logger.info("Gemini 에이전트 스크립트 실행 완료!")
